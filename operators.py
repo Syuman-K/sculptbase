@@ -33,14 +33,16 @@ class SculptBaseSettings(PropertyGroup):
     )
     target_faces: IntProperty(
         name="目標四角面数",
-        default=20000, min=100, soft_max=200000,
+        default=8000, min=100, soft_max=200000,
         description="ベースメッシュの目標面数(QuadriFlow エンジン時)。"
-                    "マルチレゾ レベル3なら実効密度は約64倍になる")
+                    "実効面数は Multires レベルごとに4倍になるので、"
+                    "レベル3なら64倍。大きすぎると変換も統合も重くなる")
     levels: IntProperty(
         name="Multires レベル",
-        default=3, min=1, max=6,
-        description="形状を焼き込む Multires の段数。ビューポート表示は"
-                    "レベル1に設定される(スカルプト時に上げる)")
+        default=2, min=1, max=6,
+        description="形状を焼き込む Multires の段数。1段ごとに面数が4倍に"
+                    "なる。ビューポート表示はレベル1に設定される"
+                    "(スカルプト時に上げる)")
     joint_distance: FloatProperty(
         name="接合部判定距離",
         default=0.001, min=0.0, soft_max=0.1, precision=4, unit='LENGTH',

@@ -29,6 +29,12 @@ class SCULPTBASE_PT_main(Panel):
         box = layout.box()
         box.label(text="形状転写", icon='MOD_MULTIRES')
         box.prop(st, "levels")
+        n_parts = max(1, sum(1 for o in context.selected_objects
+                             if o.type == 'MESH'))
+        top = st.target_faces * (4 ** st.levels)
+        box.label(text="最大レベルの面数: 約 {:,} /パーツ (計 {:,})".format(
+            top, top * n_parts),
+            icon='ERROR' if top * n_parts > 4_000_000 else 'MESH_DATA')
 
         box = layout.box()
         box.label(text="接合部保護(分割面・ダボ)", icon='LOCKED')
