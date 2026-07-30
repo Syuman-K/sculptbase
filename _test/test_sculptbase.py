@@ -73,6 +73,7 @@ def test_convert():
     st.joint_distance = 0.02
     st.separate_joints = True
     st.joint_margin = 0.3
+    st.union_inset = 0.005
     st.keep_source = True
 
     result = bpy.ops.sculptbase.convert()
@@ -191,6 +192,65 @@ def test_finalize():
           "base+joint stashed".format(len(out.data.polygons)))
 
 
+def test_progress_stages():
+    print("== progress stages reported ==")
+    sphere, cube = _make_parts()
+    sphere.select_set(True)
+    cube.select_set(True)
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.target_faces = 500
+    st.levels = 2
+    st.joint_distance = 0.02
+    st.joint_margin = 0.3
+    st.keep_source = False
+
+    seen = []
+    gen = core.iter_convert(bpy.context, st)
+    while True:
+        try:
+            frac, label = next(gen)
+            seen.append((frac, label))
+        except StopIteration:
+            break
+    if len(seen) < 8:
+        _fail("expected many progress ticks, got {}".format(len(seen)))
+    fracs = [f for f, _ in seen]
+    if fracs != sorted(fracs) or not 0.0 <= fracs[0] <= fracs[-1] < 1.0:
+        _fail("progress fractions not monotonic in [0,1): {}".format(fracs))
+    if not any("形状転写" in lab for _, lab in seen):
+        _fail("no transfer-stage label reported")
+    print("  {} ticks, {:.0%}..{:.0%}, e.g. '{}'".format(
+        len(seen), fracs[0], fracs[-1], seen[len(seen) // 2][1]))
+
+
+def test_holes_fill_fallback():
+    print("== hole fill fallback on non-planar loop ==")
+    import bmesh
+    from mathutils import Vector
+    mesh = bpy.data.meshes.new("holey")
+    bm = bmesh.new()
+    # ねじれた6角ループ(holes_fill が扱いにくい形)を1枚の帯として作る
+    ring = []
+    import math
+    for i in range(6):
+        a = i * math.pi / 3
+        z = 0.4 if i % 2 else -0.4
+        ring.append(bm.verts.new(Vector((math.cos(a), math.sin(a), z))))
+    top = [bm.verts.new(v.co + Vector((0, 0, 2))) for v in ring]
+    for i in range(6):
+        bm.faces.new((ring[i], ring[(i + 1) % 6],
+                      top[(i + 1) % 6], top[i]))
+    bm.to_mesh(mesh)
+    bm.free()
+    if core.count_boundary_edges(mesh) == 0:
+        _fail("test setup: open tube should have boundaries")
+    core.fill_holes_mesh(mesh)
+    if core.count_boundary_edges(mesh) != 0:
+        _fail("fallback fan-fill left boundary edges")
+    print("  twisted open tube -> watertight")
+
+
 def test_remask():
     print("== remask on plain meshes ==")
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -229,6 +289,10 @@ def main():
         test_convert()
         print()
         test_finalize()
+        print()
+        test_holes_fill_fallback()
+        print()
+        test_progress_stages()
         print()
         test_remask()
     finally:

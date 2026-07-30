@@ -37,6 +37,7 @@ class SCULPTBASE_PT_main(Panel):
         sub = box.column()
         sub.enabled = st.separate_joints
         sub.prop(st, "joint_margin")
+        sub.prop(st, "union_inset")
 
         layout.prop(st, "keep_source")
 

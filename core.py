@@ -144,25 +144,34 @@ def quad_remesh(context, obj, engine, target_faces):
 # --------------------------------------------------------------------------- #
 # 形状転写(Multires 焼き込み)
 # --------------------------------------------------------------------------- #
+def _transfer_level(context, base, dense, level):
+    """Multires を1段細分化し、``dense`` の形状をそのレベルへ焼き込む。"""
+    with _override(context, base, [base]):
+        bpy.ops.object.multires_subdivide(modifier=MULTIRES_NAME,
+                                          mode='CATMULL_CLARK')
+    ref = _make_reference(context, base, dense, level)
+    try:
+        with _override(context, base, [base, ref]):
+            bpy.ops.object.multires_reshape(modifier=MULTIRES_NAME)
+    finally:
+        mesh = ref.data
+        bpy.data.objects.remove(ref, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+
+def _finish_multires(mr, levels):
+    mr.levels = min(1, levels)          # ビューポートは軽いレベルで表示
+    mr.sculpt_levels = levels
+    mr.render_levels = levels
+
+
 def transfer_to_multires(context, base, dense, levels):
     """``base`` に Multires を付け、``dense`` の形状を各レベルへ焼き込む。"""
     mr = base.modifiers.new(MULTIRES_NAME, 'MULTIRES')
     for _lvl in range(1, levels + 1):
-        with _override(context, base, [base]):
-            bpy.ops.object.multires_subdivide(modifier=MULTIRES_NAME,
-                                              mode='CATMULL_CLARK')
-        ref = _make_reference(context, base, dense, _lvl)
-        try:
-            with _override(context, base, [base, ref]):
-                bpy.ops.object.multires_reshape(modifier=MULTIRES_NAME)
-        finally:
-            mesh = ref.data
-            bpy.data.objects.remove(ref, do_unlink=True)
-            if mesh.users == 0:
-                bpy.data.meshes.remove(mesh)
-    mr.levels = min(1, levels)          # ビューポートは軽いレベルで表示
-    mr.sculpt_levels = levels
-    mr.render_levels = levels
+        _transfer_level(context, base, dense, _lvl)
+    _finish_multires(mr, levels)
     return mr
 
 
@@ -194,8 +203,40 @@ def _base_level_mesh(base):
 # --------------------------------------------------------------------------- #
 # 接合部の分離(原形保持)
 # --------------------------------------------------------------------------- #
+def _boundary_loops(edges):
+    """境界エッジ集合を連結ループごとの頂点リストに分解する。"""
+    adj = {}
+    for e in edges:
+        for v in e.verts:
+            adj.setdefault(v, []).append(e)
+    unvisited = set(edges)
+    loops = []
+    while unvisited:
+        e = unvisited.pop()
+        loop = [e.verts[0], e.verts[1]]
+        while True:
+            nxt = None
+            for cand in adj.get(loop[-1], ()):
+                if cand in unvisited:
+                    nxt = cand
+                    break
+            if nxt is None:
+                break
+            unvisited.discard(nxt)
+            loop.append(nxt.other_vert(loop[-1]))
+        if loop[0] == loop[-1]:
+            loop.pop()
+        loops.append(loop)
+    return loops
+
+
 def fill_holes_mesh(mesh):
-    """境界ループ(穴)を面で塞ぐ。塞いだ面の数を返す。"""
+    """境界ループ(穴)を面で塞ぐ。塞いだ面の数を返す。
+
+    ``holes_fill`` が失敗する複雑なループ(非平面・ねじれ)は、ループ中心に
+    頂点を立てた扇形で強制的に塞ぐ。ボクセル系と違い形状は変えないので、
+    後段(リメッシュ/ブーリアン)が水密入力を前提にできる。
+    """
     bm = bmesh.new()
     bm.from_mesh(mesh)
     boundary = [e for e in bm.edges if e.is_boundary]
@@ -203,11 +244,28 @@ def fill_holes_mesh(mesh):
         bm.free()
         return 0
     result = bmesh.ops.holes_fill(bm, edges=boundary, sides=0)
-    n = len(result.get("faces", ()))
+    n_faces = len(result.get("faces", ()))
+    remaining = [e for e in bm.edges if e.is_boundary]
+    if remaining:
+        for loop in _boundary_loops(remaining):
+            if len(loop) < 3:
+                continue
+            center = Vector()
+            for v in loop:
+                center += v.co
+            center /= len(loop)
+            cv = bm.verts.new(center)
+            for a, b in zip(loop, loop[1:] + loop[:1]):
+                try:
+                    bm.faces.new((a, b, cv))
+                    n_faces += 1
+                except ValueError:
+                    pass
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
     bm.to_mesh(mesh)
     bm.free()
     mesh.update()
-    return n
+    return n_faces
 
 
 def count_boundary_edges(mesh):
@@ -350,19 +408,18 @@ def _remove_object(obj):
         bpy.data.meshes.remove(mesh)
 
 
-def convert_part(context, dense, settings, other_bvhs):
-    """``dense`` パーツをスカルプト用ベースへ変換して返す。
+def _convert_part_stages(context, dense, settings, other_bvhs):
+    """``convert_part`` の段階実行ジェネレーター。
 
-    接合部の原形保持が有効で接合部が見つかった場合、ダボ+スカートは
-    「<名前>_joint」として元ジオメトリのまま分離され、本体だけが
-    リメッシュ・転写される。``dense`` 自体は SB_Source に退避される
-    (keep_source が偽なら削除)。結果オブジェクトは元の名前を引き継ぐ。
+    重い処理の直前に ``(パーツ内進捗 0..1, ラベル)`` を yield し、最後に
+    変換結果のベースオブジェクトを return する(モーダルの進捗表示用)。
     """
     name = dense.name
     dense.name = name + "_src"
 
     body = joint = None
     if getattr(settings, "separate_joints", True):
+        yield 0.02, "接合部を分離"
         body, joint = separate_joint(
             context, dense, other_bvhs,
             settings.joint_distance + settings.joint_margin)
@@ -370,10 +427,23 @@ def convert_part(context, dense, settings, other_bvhs):
     transfer_src = body if joint is not None else dense
     base = duplicate_object(context, transfer_src, name=name)
 
+    yield 0.1, "四角リメッシュ"
     quad_remesh(context, base, settings.engine, settings.target_faces)
-    transfer_to_multires(context, base, transfer_src, settings.levels)
+    # リメッシュ器が閉じ損ねた場合に備えて塞ぐ(後段は水密前提)。
+    filled = fill_holes_mesh(base.data)
+    if filled:
+        print("[SculptBase] '{}': リメッシュ後の穴 {} 面を補修".format(
+            name, filled))
 
-    # 接合部チャンク自身も保護対象に含めてベースをマスクする。
+    levels = settings.levels
+    mr = base.modifiers.new(MULTIRES_NAME, 'MULTIRES')
+    for lvl in range(1, levels + 1):
+        yield 0.15 + 0.75 * (lvl - 1) / levels, "形状転写 L{}/{}".format(
+            lvl, levels)
+        _transfer_level(context, base, transfer_src, lvl)
+    _finish_multires(mr, levels)
+
+    yield 0.92, "接合部マスク"
     guard_bvhs = list(other_bvhs)
     if joint is not None:
         jb = build_bvh(joint)
@@ -397,15 +467,92 @@ def convert_part(context, dense, settings, other_bvhs):
     return base
 
 
+def convert_part(context, dense, settings, other_bvhs):
+    """``dense`` パーツをスカルプト用ベースへ変換して返す(同期実行)。
+
+    接合部の原形保持が有効で接合部が見つかった場合、ダボ+スカートは
+    「<名前>_joint」として元ジオメトリのまま分離され、本体だけが
+    リメッシュ・転写される。``dense`` 自体は SB_Source に退避される
+    (keep_source が偽なら削除)。結果オブジェクトは元の名前を引き継ぐ。
+    """
+    gen = _convert_part_stages(context, dense, settings, other_bvhs)
+    while True:
+        try:
+            next(gen)
+        except StopIteration as stop:
+            return stop.value
+
+
 # --------------------------------------------------------------------------- #
 # 出力用の統合(Multires 適用 + 接合部ブーリアン)
 # --------------------------------------------------------------------------- #
-def finalize_part(context, base):
+def _inset_under_joint(out, joint_bvh, amount, reach):
+    """_joint に覆われた頂点だけを法線の内側へ ``amount`` 沈める。
+
+    転写後のベース表面と _joint のスカートはほぼ同一面で重なるため、
+    そのままブーリアンすると退化して穴だらけの結果になる。外向き法線の
+    レイが ``reach`` 以内で _joint に当たる=チャンクに覆われている頂点を
+    内側へ沈めることで、交差が横断的になりブーリアンが安定する。沈んだ
+    領域は上を _joint が覆うので、出力表面には現れない。
+    """
+    if amount <= 0.0:
+        return 0
+    mesh = out.data
+    mw = out.matrix_world
+    nmat = mw.inverted().transposed().to_3x3()
+    moved = []
+    for v in mesh.vertices:
+        co = mw @ v.co
+        n = (nmat @ v.normal).normalized()
+        hit = joint_bvh.ray_cast(co + n * 1e-5, n, reach)
+        if hit[0] is not None:
+            moved.append(v)
+    for v in moved:
+        v.co = v.co - v.normal * amount
+    if moved:
+        mesh.update()
+    return len(moved)
+
+
+def _union_joint(context, out, joint):
+    """``out`` に _joint をブーリアン統合する。使ったソルバー名を返す。
+
+    Blender 4.5+ の Manifold ソルバー(高速・堅牢)を優先し、
+    使えない/失敗した場合は Exact に切り替える。
+    """
+    def _run(solver):
+        mod = out.modifiers.new("SB_Union", 'BOOLEAN')
+        mod.operation = 'UNION'
+        mod.object = joint
+        try:
+            mod.solver = solver
+        except TypeError:
+            out.modifiers.remove(mod)
+            return None
+        snapshot = out.data.copy()
+        _bake_evaluated(context, out)
+        if count_boundary_edges(out.data) == 0:
+            bpy.data.meshes.remove(snapshot)
+            return solver
+        old = out.data
+        out.data = snapshot                  # 失敗: 統合前に戻して次を試す
+        if old.users == 0:
+            bpy.data.meshes.remove(old)
+        return None
+
+    for solver in ('MANIFOLD', 'EXACT'):
+        used = _run(solver)
+        if used:
+            return used
+    return None
+
+
+def finalize_part(context, base, settings):
     """``base`` の Multires を適用し、_joint と統合した出力メッシュを返す。
 
     ベースと _joint は SB_Sculpt コレクションへ退避され(再編集用に温存)、
-    出力オブジェクトが元の名前を引き継ぐ。接合部は exact ブーリアンで
-    統合されるため、ダボのジオメトリは元のまま出力される。
+    出力オブジェクトが元の名前を引き継ぐ。接合部はブーリアンで統合される
+    ため、ダボのジオメトリは元のまま出力される。
     """
     name = base.name
     joint = bpy.data.objects.get(name + JOINT_SUFFIX)
@@ -415,15 +562,22 @@ def finalize_part(context, base):
     if mr is not None:
         mr.levels = mr.sculpt_levels or mr.total_levels
     _bake_evaluated(context, out)
+    fill_holes_mesh(out.data)
 
     warn = None
     if joint is not None:
-        mod = out.modifiers.new("SB_Union", 'BOOLEAN')
-        mod.operation = 'UNION'
-        mod.solver = 'EXACT'
-        mod.object = joint
-        _bake_evaluated(context, out)
-    if count_boundary_edges(out.data) != 0:
+        fill_holes_mesh(joint.data)
+        jb = build_bvh(joint)
+        if jb is not None:
+            reach = settings.joint_distance + settings.joint_margin
+            _inset_under_joint(out, jb, settings.union_inset,
+                               max(reach, settings.union_inset * 4))
+        used = _union_joint(context, out, joint)
+        if used is None:
+            warn = ("'{}' の接合部統合に失敗しました(境界エッジが残存)。"
+                    "分離マージン/統合オフセットを広げて再試行してください"
+                    ).format(name)
+    elif count_boundary_edges(out.data) != 0:
         warn = "'{}' の出力メッシュに境界エッジが残っています".format(name)
 
     base.name = name + "_sculpt"
@@ -438,46 +592,84 @@ def finalize_part(context, base):
     return out, warn
 
 
-def finalize_selection(context):
-    """選択中の変換済みベースを一括で出力用に統合する。"""
+def _select_only(context, objects):
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    for obj in objects:
+        obj.select_set(True)
+    if objects:
+        context.view_layer.objects.active = objects[0]
+
+
+def iter_finalize(context, settings):
+    """出力統合の段階実行ジェネレーター(進捗表示用)。
+
+    各パーツの直前に ``(進捗 0..1, ラベル)`` を yield し、完了時に
+    ``(results, warnings)`` を return する。
+    """
     bases = [o for o in context.selected_objects if o.get(RESULT_TAG)]
     if not bases:
         raise RuntimeError(
             "変換済みのベース(スカルプトベースに変換した結果)を選択してください。")
     results = []
     warnings = []
-    for base in bases:
-        out, warn = finalize_part(context, base)
+    for i, base in enumerate(bases):
+        yield i / len(bases), "統合 {} ({}/{})".format(
+            base.name, i + 1, len(bases))
+        out, warn = finalize_part(context, base, settings)
         results.append(out)
         if warn:
             warnings.append(warn)
-    for obj in context.selected_objects:
-        obj.select_set(False)
-    for obj in results:
-        obj.select_set(True)
-    if results:
-        context.view_layer.objects.active = results[0]
+    _select_only(context, results)
     return results, warnings
 
 
-def convert_selection(context, settings):
-    """選択中のメッシュ全部を変換する。``(results, n_protected)`` を返す。"""
+def finalize_selection(context, settings):
+    """選択中の変換済みベースを一括で出力用に統合する(同期実行)。"""
+    gen = iter_finalize(context, settings)
+    while True:
+        try:
+            next(gen)
+        except StopIteration as stop:
+            return stop.value
+
+
+def iter_convert(context, settings):
+    """変換の段階実行ジェネレーター(進捗表示用)。
+
+    重い処理の直前に ``(全体進捗 0..1, ラベル)`` を yield し、完了時に
+    ``(results, n_protected)`` を return する。
+    """
     parts = [o for o in context.selected_objects if o.type == 'MESH']
     if not parts:
         raise RuntimeError("変換対象のメッシュを選択してください。")
     bvhs = {o: build_bvh(o) for o in parts}
     results = []
     total_protected = 0
-    for dense in parts:
+    n = len(parts)
+    for i, dense in enumerate(parts):
         others = [bvh for o, bvh in bvhs.items()
                   if o is not dense and bvh is not None]
-        base = convert_part(context, dense, settings, others)
+        gen = _convert_part_stages(context, dense, settings, others)
+        base = None
+        while base is None:
+            try:
+                frac, label = next(gen)
+                yield (i + frac) / n, "{} ({}/{}) — {}".format(
+                    dense.name.removesuffix("_src"), i + 1, n, label)
+            except StopIteration as stop:
+                base = stop.value
         results.append(base)
         total_protected += base.get("sculptbase_protected_verts", 0)
-    for obj in context.selected_objects:
-        obj.select_set(False)
-    for obj in results:
-        obj.select_set(True)
-    if results:
-        context.view_layer.objects.active = results[0]
+    _select_only(context, results)
     return results, total_protected
+
+
+def convert_selection(context, settings):
+    """選択中のメッシュ全部を変換する(同期実行)。"""
+    gen = iter_convert(context, settings)
+    while True:
+        try:
+            next(gen)
+        except StopIteration as stop:
+            return stop.value

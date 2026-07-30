@@ -59,6 +59,14 @@ class SculptBaseSettings(PropertyGroup):
         description="接合部を分離する際、判定距離にこの量を足した範囲まで"
                     "スカートとして含める。広いほどブーリアン統合が確実に"
                     "なるが、その分スカルプトできない領域が増える")
+    union_inset: FloatProperty(
+        name="統合オフセット",
+        default=0.0005, min=0.0, soft_max=0.05, precision=5, unit='LENGTH',
+        description="出力統合時、接合部チャンクに覆われた本体表面をこの量"
+                    "だけ内側へ沈める。ベース表面とチャンクのスカートが"
+                    "同一面で重なるとブーリアンが退化して穴が空くため、"
+                    "交差を横断的にして安定させる。沈めた領域はチャンクに"
+                    "覆われるので出力表面には現れない")
     keep_source: BoolProperty(
         name="ソースを退避して残す", default=True,
         description="変換後の高密度ソースを SB_Source コレクションに移して"
@@ -66,7 +74,85 @@ class SculptBaseSettings(PropertyGroup):
                     "なるため重くならない)。無効なら削除する")
 
 
-class SCULPTBASE_OT_convert(Operator):
+class _ProgressModal:
+    """段階実行ジェネレーターをタイマーで回し、進捗バーを出すミックスイン。
+
+    ヘッダーの進捗バー(レンダリング時と同じもの)とステータス行のゲージを
+    更新しながら、1ティックにつき1段階ずつ処理する。Esc で中断できる。
+    サブクラスは ``_iter(context)`` と ``_report_done(result)`` を実装する。
+    """
+
+    _timer = None
+    _gen = None
+    _frac = 0.0
+    _label = ""
+
+    def invoke(self, context, event):
+        if context.window is None:
+            return self.execute(context)
+        st = context.scene.sculptbase
+        try:
+            self._gen = self._iter(context, st)
+        except RuntimeError as exc:
+            self.report({'WARNING'}, str(exc))
+            return {'CANCELLED'}
+        wm = context.window_manager
+        wm.progress_begin(0.0, 1.0)
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        self._set_status(context)
+        return {'RUNNING_MODAL'}
+
+    def _set_status(self, context):
+        filled = int(round(20 * self._frac))
+        bar = "█" * filled + "░" * (20 - filled)
+        try:
+            context.workspace.status_text_set(
+                "{}: [{}] {}%  {}  —  Esc で中止".format(
+                    self.bl_label, bar, int(round(100 * self._frac)),
+                    self._label))
+        except Exception:
+            pass
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self._cleanup(context)
+            self.report({'WARNING'},
+                        "SculptBase: 中止しました({}% 時点)".format(
+                            int(round(100 * self._frac))))
+            return {'CANCELLED'}
+        if event.type != 'TIMER':
+            return {'RUNNING_MODAL'}
+        try:
+            self._frac, self._label = next(self._gen)
+            context.window_manager.progress_update(self._frac)
+            self._set_status(context)
+        except StopIteration as stop:
+            self._cleanup(context)
+            self._report_done(stop.value)
+            return {'FINISHED'}
+        except Exception as exc:  # noqa: BLE001 - surface any failure
+            self._cleanup(context)
+            self.report({'ERROR'}, "SculptBase 失敗: {}".format(exc))
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    def _cleanup(self, context):
+        wm = context.window_manager
+        if self._timer is not None:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        try:
+            wm.progress_end()
+        except Exception:
+            pass
+        try:
+            context.workspace.status_text_set(None)
+        except Exception:
+            pass
+
+
+class SCULPTBASE_OT_convert(_ProgressModal, Operator):
     bl_idname = "sculptbase.convert"
     bl_label = "スカルプトベースに変換"
     bl_description = ("選択パーツを四角リメッシュし、Multires に元形状を"
@@ -78,25 +164,27 @@ class SCULPTBASE_OT_convert(Operator):
     def poll(cls, context):
         return any(o.type == 'MESH' for o in context.selected_objects)
 
+    def _iter(self, context, settings):
+        return core.iter_convert(context, settings)
+
+    def _report_done(self, value):
+        results, n_protected = value
+        self.report(
+            {'INFO'},
+            "SculptBase: {} パーツを変換, 接合部 {} 頂点をマスク保護".format(
+                len(results), n_protected))
+
     def execute(self, context):
         st = context.scene.sculptbase
-        wm = context.window_manager
-        parts = [o for o in context.selected_objects if o.type == 'MESH']
-        wm.progress_begin(0, len(parts))
         try:
-            results, n_protected = core.convert_selection(context, st)
+            value = core.convert_selection(context, st)
         except RuntimeError as exc:
             self.report({'WARNING'}, str(exc))
             return {'CANCELLED'}
         except Exception as exc:  # noqa: BLE001 - surface any failure
             self.report({'ERROR'}, "SculptBase 失敗: {}".format(exc))
             return {'CANCELLED'}
-        finally:
-            wm.progress_end()
-        self.report(
-            {'INFO'},
-            "SculptBase: {} パーツを変換, 接合部 {} 頂点をマスク保護".format(
-                len(results), n_protected))
+        self._report_done(value)
         return {'FINISHED'}
 
 
@@ -128,34 +216,42 @@ class SCULPTBASE_OT_remask(Operator):
         return {'FINISHED'}
 
 
-class SCULPTBASE_OT_finalize(Operator):
+class SCULPTBASE_OT_finalize(_ProgressModal, Operator):
     bl_idname = "sculptbase.finalize"
     bl_label = "出力用に統合"
     bl_description = ("選択中の変換済みベースの Multires をトップレベルで"
-                     "適用し、分離してあった接合部(_joint)を exact "
-                     "ブーリアンで統合した出力メッシュを作る。ベースと "
-                     "_joint は SB_Sculpt に退避され再編集できる")
+                     "適用し、分離してあった接合部(_joint)をブーリアンで"
+                     "統合した出力メッシュを作る。ベースと _joint は "
+                     "SB_Sculpt に退避され再編集できる")
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
         return any(o.get(core.RESULT_TAG) for o in context.selected_objects)
 
-    def execute(self, context):
-        try:
-            results, warnings = core.finalize_selection(context)
-        except RuntimeError as exc:
-            self.report({'WARNING'}, str(exc))
-            return {'CANCELLED'}
-        except Exception as exc:  # noqa: BLE001 - surface any failure
-            self.report({'ERROR'}, "SculptBase 統合失敗: {}".format(exc))
-            return {'CANCELLED'}
+    def _iter(self, context, settings):
+        return core.iter_finalize(context, settings)
+
+    def _report_done(self, value):
+        results, warnings = value
         for warn in warnings:
             self.report({'WARNING'}, warn)
         self.report(
             {'INFO'},
             "SculptBase: {} パーツを出力用に統合しました"
             "(PhasePorter で print_ へ移行できます)".format(len(results)))
+
+    def execute(self, context):
+        st = context.scene.sculptbase
+        try:
+            value = core.finalize_selection(context, st)
+        except RuntimeError as exc:
+            self.report({'WARNING'}, str(exc))
+            return {'CANCELLED'}
+        except Exception as exc:  # noqa: BLE001 - surface any failure
+            self.report({'ERROR'}, "SculptBase 統合失敗: {}".format(exc))
+            return {'CANCELLED'}
+        self._report_done(value)
         return {'FINISHED'}
 
 
