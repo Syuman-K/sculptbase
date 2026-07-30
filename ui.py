@@ -37,7 +37,7 @@ class SCULPTBASE_PT_main(Panel):
         sub = box.column()
         sub.enabled = st.separate_joints
         sub.prop(st, "joint_margin")
-        sub.prop(st, "union_inset")
+        sub.prop(st, "union_depth")
 
         layout.prop(st, "keep_source")
 
@@ -49,6 +49,7 @@ class SCULPTBASE_PT_main(Panel):
 
         layout.separator()
         layout.label(text="出力(print_ 移行前)", icon='EXPORT')
+        layout.prop(st, "verify_joints")
         layout.operator("sculptbase.finalize", icon='MOD_BOOLEAN')
 
 

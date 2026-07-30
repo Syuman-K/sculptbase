@@ -59,14 +59,20 @@ class SculptBaseSettings(PropertyGroup):
         description="接合部を分離する際、判定距離にこの量を足した範囲まで"
                     "スカートとして含める。広いほどブーリアン統合が確実に"
                     "なるが、その分スカルプトできない領域が増える")
-    union_inset: FloatProperty(
-        name="統合オフセット",
-        default=0.0005, min=0.0, soft_max=0.05, precision=5, unit='LENGTH',
-        description="出力統合時、接合部チャンクに覆われた本体表面をこの量"
-                    "だけ内側へ沈める。ベース表面とチャンクのスカートが"
-                    "同一面で重なるとブーリアンが退化して穴が空くため、"
-                    "交差を横断的にして安定させる。沈めた領域はチャンクに"
-                    "覆われるので出力表面には現れない")
+    union_depth: FloatProperty(
+        name="押し出し深さ",
+        default=0.0, min=0.0, soft_max=0.05, precision=5, unit='LENGTH',
+        description="出力統合時、接合部チャンクの「蓋」をこの深さだけ"
+                    "押し出して角柱にする。蓋がベース表面と同一面で重なると"
+                    "ブーリアンが退化して穴が空くのを防ぐ。押し出し方向は"
+                    "ダボなら本体内部、ダボ穴なら外側の空間なので出力表面"
+                    "には現れない。0 で自動(接合部サイズの2%)")
+    verify_joints: BoolProperty(
+        name="統合後に接合部を検証", default=True,
+        description="出力統合のあと、接合部の形状がソース(SB_Source に"
+                    "退避された元パーツ)と一致するかを抜き取り検査し、"
+                    "食い違いが大きければ警告する。「ソースを退避して残す」"
+                    "が有効なときだけ動作する")
     keep_source: BoolProperty(
         name="ソースを退避して残す", default=True,
         description="変換後の高密度ソースを SB_Source コレクションに移して"

@@ -73,7 +73,7 @@ def test_convert():
     st.joint_distance = 0.02
     st.separate_joints = True
     st.joint_margin = 0.3
-    st.union_inset = 0.005
+    st.union_depth = 0.02
     st.keep_source = True
 
     result = bpy.ops.sculptbase.convert()
@@ -224,6 +224,97 @@ def test_progress_stages():
         len(seen), fracs[0], fracs[-1], seen[len(seen) // 2][1]))
 
 
+def test_socket_not_filled():
+    """ダボ穴(窪み)側のパーツで、穴が埋まらずに残ることを検証する。
+
+    実データ(sculpt_hoge_260731_04)で発生した回帰: 接合部チャンクが
+    「空洞そのもの」になる窪み側で、常に UNION していたため穴が埋まった。
+    """
+    print("== socket (female) side is not filled in ==")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    # ソケット付きの箱: 上面から円筒を掘る
+    bpy.ops.mesh.primitive_cube_add(size=2)
+    box = bpy.context.active_object
+    box.name = "socket_part"
+    bpy.ops.mesh.primitive_cylinder_add(vertices=24, radius=0.25, depth=1.0,
+                                        location=(0, 0, 0.8))
+    drill = bpy.context.active_object
+    mod = box.modifiers.new("hole", 'BOOLEAN')
+    mod.operation = 'DIFFERENCE'
+    mod.object = drill
+    with bpy.context.temp_override(object=box, active_object=box):
+        bpy.ops.object.modifier_apply(modifier="hole")
+    bpy.data.objects.remove(drill, do_unlink=True)
+
+    # ソケットに差し込まれる相手パーツ(接合部検出のトリガー)
+    bpy.ops.mesh.primitive_cylinder_add(vertices=24, radius=0.25, depth=0.6,
+                                        location=(0, 0, 1.0))
+    pin = bpy.context.active_object
+    pin.name = "pin_part"
+
+    def _is_open(ob, z):
+        """(0,0,z) がメッシュの外(=穴が空いている)かを判定する。"""
+        from mathutils import Vector
+        bvh = core.build_bvh(ob)
+        p = Vector((0, 0, z))
+        d = Vector((0.577, 0.577, 0.577))
+        n, origin = 0, p.copy()
+        for _ in range(64):
+            hit = bvh.ray_cast(origin, d)
+            if hit[0] is None:
+                break
+            n += 1
+            origin = hit[0] + d * 1e-5
+        return n % 2 == 0
+
+    probe_z = 0.6                      # ソケット内部(掘られた領域)
+    if not _is_open(box, probe_z):
+        _fail("test setup: socket should be hollow at z={}".format(probe_z))
+
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.target_faces = 800
+    st.levels = 2
+    st.joint_distance = 0.02
+    st.separate_joints = True
+    st.joint_margin = 0.15
+    st.union_depth = 0.0               # 自動
+    st.keep_source = False
+
+    box.select_set(True)
+    pin.select_set(True)
+    bpy.context.view_layer.objects.active = box
+    if bpy.ops.sculptbase.convert() != {'FINISHED'}:
+        _fail("convert failed on socket part")
+
+    joint = bpy.data.objects.get("socket_part_joint")
+    if joint is None:
+        _fail("socket joint chunk not separated")
+    import bmesh
+    bm = bmesh.new()
+    bm.from_mesh(joint.data)
+    vol = bm.calc_volume(signed=True)
+    bm.free()
+    print("  socket joint chunk signed volume: {:+.5f} (負なら窪み)".format(vol))
+    if vol >= 0.0:
+        _fail("socket chunk should have negative signed volume")
+
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    base = bpy.data.objects["socket_part"]
+    base.select_set(True)
+    bpy.context.view_layer.objects.active = base
+    if bpy.ops.sculptbase.finalize() != {'FINISHED'}:
+        _fail("finalize failed on socket part")
+
+    out = bpy.data.objects["socket_part"]
+    if core.count_boundary_edges(out.data) != 0:
+        _fail("socket output is not watertight")
+    if not _is_open(out, probe_z):
+        _fail("SOCKET WAS FILLED IN — the dowel hole disappeared")
+    print("  socket still hollow after finalize, output watertight")
+
+
 def test_holes_fill_fallback():
     print("== hole fill fallback on non-planar loop ==")
     import bmesh
@@ -289,6 +380,8 @@ def main():
         test_convert()
         print()
         test_finalize()
+        print()
+        test_socket_not_filled()
         print()
         test_holes_fill_fallback()
         print()

@@ -230,23 +230,38 @@ def _boundary_loops(edges):
     return loops
 
 
-def fill_holes_mesh(mesh):
-    """境界ループ(穴)を面で塞ぐ。塞いだ面の数を返す。
+def _match_winding(face, olds):
+    """``face`` の向きを、隣接する既存面 ``olds`` と整合させる。
 
-    ``holes_fill`` が失敗する複雑なループ(非平面・ねじれ)は、ループ中心に
-    頂点を立てた扇形で強制的に塞ぐ。ボクセル系と違い形状は変えないので、
-    後段(リメッシュ/ブーリアン)が水密入力を前提にできる。
+    共有エッジを両者が同じ向きにたどっていれば裏返っているので反転する。
+    全体の recalc は使わない — 元パッチの向き(パーツ外向き)を保つことが、
+    後段で「出っ張り(ダボ)か窪み(ダボ穴)か」を符号付き体積で判定する
+    根拠になるため。
     """
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
+    for loop in face.loops:
+        for other in loop.edge.link_faces:
+            if other is face or other not in olds:
+                continue
+            for ol in other.loops:
+                if ol.edge is loop.edge:
+                    if ol.vert is loop.vert:      # 同じ向き = 不整合
+                        face.normal_flip()
+                    return True
+    return False
+
+
+def _fill_holes_bm(bm):
+    """``bm`` の境界ループを塞ぎ、新しくできた面のリストを返す。"""
     boundary = [e for e in bm.edges if e.is_boundary]
     if not boundary:
-        bm.free()
-        return 0
-    result = bmesh.ops.holes_fill(bm, edges=boundary, sides=0)
-    n_faces = len(result.get("faces", ()))
+        return []
+    olds = set(bm.faces)
+    new_faces = list(bmesh.ops.holes_fill(bm, edges=boundary,
+                                          sides=0).get("faces", ()))
     remaining = [e for e in bm.edges if e.is_boundary]
     if remaining:
+        # holes_fill が扱えないループ(非平面・ねじれ)は中心頂点を立てた
+        # 扇形で確実に塞ぐ。
         for loop in _boundary_loops(remaining):
             if len(loop) < 3:
                 continue
@@ -257,15 +272,36 @@ def fill_holes_mesh(mesh):
             cv = bm.verts.new(center)
             for a, b in zip(loop, loop[1:] + loop[:1]):
                 try:
-                    bm.faces.new((a, b, cv))
-                    n_faces += 1
+                    new_faces.append(bm.faces.new((a, b, cv)))
                 except ValueError:
                     pass
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    bm.to_mesh(mesh)
+    for f in new_faces:
+        _match_winding(f, olds)
+    bm.normal_update()
+    return new_faces
+
+
+def fill_holes_mesh(mesh, cap_layer=None):
+    """境界ループ(穴)を面で塞ぐ。塞いだ面の数を返す。
+
+    ``cap_layer`` に名前を渡すと、塞いだ面を 1、それ以外を 0 とする面
+    整数属性を書き込む(出力統合で「蓋」だけを押し出すために使う)。
+    """
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    new_faces = _fill_holes_bm(bm)
+    if cap_layer is not None:
+        layer = bm.faces.layers.int.get(cap_layer) \
+            or bm.faces.layers.int.new(cap_layer)
+        caps = set(new_faces)
+        for f in bm.faces:
+            f[layer] = 1 if f in caps else 0
+    n = len(new_faces)
+    if n or cap_layer is not None:
+        bm.to_mesh(mesh)
+        mesh.update()
     bm.free()
-    mesh.update()
-    return n_faces
+    return n
 
 
 def count_boundary_edges(mesh):
@@ -277,11 +313,15 @@ def count_boundary_edges(mesh):
     return n
 
 
+CAP_LAYER = "SB_cap"
+
+
 def _faces_subset_object(context, src, face_indices, keep, name):
     """``src`` のコピーから面集合の片側だけを残したオブジェクトを作る。
 
     ``keep`` が真なら ``face_indices`` の面を残し、偽なら取り除く。
-    残った境界の穴は塞いで水密なソリッドにする。
+    残った境界の穴は塞いで水密なソリッドにし、塞いだ「蓋」の面は
+    ``CAP_LAYER`` に記録する。元パッチの面の向きは変更しない。
     """
     obj = duplicate_object(context, src, name=name)
     bm = bmesh.new()
@@ -295,7 +335,7 @@ def _faces_subset_object(context, src, face_indices, keep, name):
     bm.to_mesh(obj.data)
     bm.free()
     obj.data.update()
-    fill_holes_mesh(obj.data)
+    fill_holes_mesh(obj.data, cap_layer=CAP_LAYER)
     return obj
 
 
@@ -486,44 +526,152 @@ def convert_part(context, dense, settings, other_bvhs):
 # --------------------------------------------------------------------------- #
 # 出力用の統合(Multires 適用 + 接合部ブーリアン)
 # --------------------------------------------------------------------------- #
-def _inset_under_joint(out, joint_bvh, amount, reach):
-    """_joint に覆われた頂点だけを法線の内側へ ``amount`` 沈める。
+def _component_solids(context, joint, depth):
+    """_joint を連結成分ごとのブーリアン用ソリッドに分解する。
 
-    転写後のベース表面と _joint のスカートはほぼ同一面で重なるため、
-    そのままブーリアンすると退化して穴だらけの結果になる。外向き法線の
-    レイが ``reach`` 以内で _joint に当たる=チャンクに覆われている頂点を
-    内側へ沈めることで、交差が横断的になりブーリアンが安定する。沈んだ
-    領域は上を _joint が覆うので、出力表面には現れない。
+    ``[(オブジェクト, 'UNION' | 'DIFFERENCE'), ...]`` を返す。
+
+    接合部チャンクは元パッチの向き(パーツ外向き)を保ったまま蓋で閉じて
+    あるので、**符号付き体積の符号がそのまま特徴の種類**になる:
+
+    * 正 = 出っ張り(ダボ本体) → 本体に ``UNION`` して復元する
+    * 負 = 窪み(ダボ穴)      → 本体から ``DIFFERENCE`` して掘り直す
+
+    v0.2.0 は常に UNION していたため、ダボ穴のチャンク(=空洞そのもの)を
+    足してしまい穴が埋まっていた。
+
+    さらに、蓋はベース表面とほぼ同一面に重なりブーリアンが退化するため、
+    蓋の面を自身の法線方向へ ``depth`` だけ押し出して角柱にする。この向きは
+    「特徴の反対側」に一致する(ダボなら本体内部へ、ダボ穴なら外側の空間へ)
+    ので、交差が横断的になり、しかも出力表面には現れない。
     """
-    if amount <= 0.0:
-        return 0
-    mesh = out.data
-    mw = out.matrix_world
+    mesh = joint.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    layer = bm.faces.layers.int.get(CAP_LAYER)
+
+    # 連結成分ごとに面を分ける
+    bm.faces.ensure_lookup_table()
+    seen = set()
+    groups = []
+    for f in bm.faces:
+        if f in seen:
+            continue
+        stack, group = [f], []
+        seen.add(f)
+        while stack:
+            cur = stack.pop()
+            group.append(cur)
+            for e in cur.edges:
+                for nb in e.link_faces:
+                    if nb not in seen:
+                        seen.add(nb)
+                        stack.append(nb)
+        groups.append(group)
+
+    solids = []
+    for i, group in enumerate(groups):
+        sub = bmesh.new()
+        vmap = {}
+        cap_new = []
+        sub_layer = sub.faces.layers.int.new(CAP_LAYER)
+        for f in group:
+            verts = []
+            for v in f.verts:
+                nv = vmap.get(v)
+                if nv is None:
+                    nv = sub.verts.new(v.co)
+                    vmap[v] = nv
+                verts.append(nv)
+            try:
+                nf = sub.faces.new(verts)
+            except ValueError:
+                continue
+            nf[sub_layer] = f[layer] if layer else 0
+            if nf[sub_layer]:
+                cap_new.append(nf)
+        sub.normal_update()
+        volume = sub.calc_volume(signed=True)
+
+        if cap_new and depth > 0.0:
+            normal = Vector()
+            for f in cap_new:
+                normal += f.normal * f.calc_area()
+            if normal.length > 1e-12:
+                normal.normalize()
+                res = bmesh.ops.extrude_face_region(sub, geom=cap_new)
+                moved = [g for g in res["geom"]
+                         if isinstance(g, bmesh.types.BMVert)]
+                bmesh.ops.translate(sub, verts=moved, vec=normal * depth)
+                bmesh.ops.delete(sub, geom=cap_new, context='FACES_ONLY')
+                sub.normal_update()
+
+        if volume < 0.0:                 # 窪み: 正の向きのソリッドに直す
+            bmesh.ops.reverse_faces(sub, faces=sub.faces)
+        op = 'DIFFERENCE' if volume < 0.0 else 'UNION'
+
+        data = bpy.data.meshes.new("{}_c{}".format(joint.name, i))
+        sub.to_mesh(data)
+        sub.free()
+        ob = bpy.data.objects.new(data.name, data)
+        ob.matrix_world = joint.matrix_world.copy()
+        context.collection.objects.link(ob)
+        solids.append((ob, op))
+    bm.free()
+    return solids
+
+
+def _point_inside(tree, point):
+    """レイの交差回数の偶奇で ``point`` がソリッド内部かを判定する。"""
+    direction = Vector((0.7071, 0.5, 0.5)).normalized()
+    origin = point.copy()
+    hits = 0
+    for _ in range(64):
+        loc = tree.ray_cast(origin, direction)[0]
+        if loc is None:
+            break
+        hits += 1
+        origin = loc + direction * 1e-5
+    return hits % 2 == 1
+
+
+def verify_joint_region(out, source, joint, probe):
+    """統合結果が接合部でソースと食い違う割合を返す(0.0〜1.0)。
+
+    接合部チャンクの各頂点から法線方向 ``probe`` だけ離れた点について、
+    ソースと出力で内部/外部が一致するかを調べる。ダボ穴が埋まる・ダボが
+    欠けるといった破綻は、この不一致率として現れる。
+    """
+    tree_src, tree_out = build_bvh(source), build_bvh(out)
+    if tree_src is None or tree_out is None:
+        return 0.0
+    mw = joint.matrix_world
     nmat = mw.inverted().transposed().to_3x3()
-    moved = []
-    for v in mesh.vertices:
-        co = mw @ v.co
+    verts = joint.data.vertices
+    if not len(verts):
+        return 0.0
+    step = max(1, len(verts) // 400)          # 最大400点のサンプリング
+    bad = total = 0
+    for i in range(0, len(verts), step):
+        v = verts[i]
         n = (nmat @ v.normal).normalized()
-        hit = joint_bvh.ray_cast(co + n * 1e-5, n, reach)
-        if hit[0] is not None:
-            moved.append(v)
-    for v in moved:
-        v.co = v.co - v.normal * amount
-    if moved:
-        mesh.update()
-    return len(moved)
+        p = (mw @ v.co) + n * probe
+        total += 1
+        if _point_inside(tree_src, p) != _point_inside(tree_out, p):
+            bad += 1
+    return bad / max(total, 1)
 
 
-def _union_joint(context, out, joint):
-    """``out`` に _joint をブーリアン統合する。使ったソルバー名を返す。
+def _apply_boolean(context, out, cutter, operation):
+    """``out`` に ``cutter`` をブーリアン適用する。使ったソルバー名を返す。
 
     Blender 4.5+ の Manifold ソルバー(高速・堅牢)を優先し、
-    使えない/失敗した場合は Exact に切り替える。
+    使えない/水密でない結果になった場合は Exact に切り替える。
     """
     def _run(solver):
-        mod = out.modifiers.new("SB_Union", 'BOOLEAN')
-        mod.operation = 'UNION'
-        mod.object = joint
+        mod = out.modifiers.new("SB_Bool", 'BOOLEAN')
+        mod.operation = operation
+        mod.object = cutter
         try:
             mod.solver = solver
         except TypeError:
@@ -535,7 +683,7 @@ def _union_joint(context, out, joint):
             bpy.data.meshes.remove(snapshot)
             return solver
         old = out.data
-        out.data = snapshot                  # 失敗: 統合前に戻して次を試す
+        out.data = snapshot                  # 失敗: 適用前に戻して次を試す
         if old.users == 0:
             bpy.data.meshes.remove(old)
         return None
@@ -565,20 +713,47 @@ def finalize_part(context, base, settings):
     fill_holes_mesh(out.data)
 
     warn = None
-    if joint is not None:
-        fill_holes_mesh(joint.data)
-        jb = build_bvh(joint)
-        if jb is not None:
-            reach = settings.joint_distance + settings.joint_margin
-            _inset_under_joint(out, jb, settings.union_inset,
-                               max(reach, settings.union_inset * 4))
-        used = _union_joint(context, out, joint)
-        if used is None:
-            warn = ("'{}' の接合部統合に失敗しました(境界エッジが残存)。"
-                    "分離マージン/統合オフセットを広げて再試行してください"
-                    ).format(name)
-    elif count_boundary_edges(out.data) != 0:
+    stale = (joint is not None
+             and joint.data.attributes.get(CAP_LAYER) is None)
+    if stale:
+        # v0.3.0 以前で分離されたチャンクには蓋の記録が無く、押し出しが
+        # 効かないためブーリアンが退化する。統合せず作り直しを促す。
+        warn = ("'{}' の接合部は古いバージョンで分離されたため蓋の情報が"
+                "ありません。統合を中止しました —「スカルプトベースに"
+                "変換」からやり直してください").format(name)
+    elif joint is not None:
+        depth = settings.union_depth
+        if depth <= 0.0:
+            depth = max(joint.dimensions) * 0.02
+        failed = []
+        for cutter, op in _component_solids(context, joint, depth):
+            try:
+                if _apply_boolean(context, out, cutter, op) is None:
+                    failed.append(op)
+            finally:
+                _remove_object(cutter)
+        if failed:
+            warn = ("'{}' の接合部 {} 箇所の統合に失敗しました(境界エッジが"
+                    "残存)。分離マージン/押し出し深さを広げて再試行して"
+                    "ください").format(name, len(failed))
+        else:
+            # ソースが残っていれば、接合部の形状が保たれたか自己検証する。
+            source = bpy.data.objects.get(name + "_src")
+            if source is not None and settings.verify_joints:
+                probe = max(settings.joint_distance + settings.joint_margin,
+                            max(joint.dimensions) * 0.01)
+                ratio = verify_joint_region(out, source, joint, probe)
+                if ratio > 0.05:
+                    warn = ("'{}' の接合部がソースと {:.0%} 食い違っています"
+                            "(ダボ/ダボ穴が正しく再現されていない可能性)。"
+                            "押し出し深さを大きくして再実行してください"
+                            ).format(name, ratio)
+    elif joint is None and count_boundary_edges(out.data) != 0:
         warn = "'{}' の出力メッシュに境界エッジが残っています".format(name)
+
+    if stale:                  # 作り直し前提なので退避せず元の状態を保つ
+        _remove_object(out)
+        return None, warn
 
     base.name = name + "_sculpt"
     stash_source(context, base, SCULPT_COLLECTION)
@@ -617,7 +792,8 @@ def iter_finalize(context, settings):
         yield i / len(bases), "統合 {} ({}/{})".format(
             base.name, i + 1, len(bases))
         out, warn = finalize_part(context, base, settings)
-        results.append(out)
+        if out is not None:
+            results.append(out)
         if warn:
             warnings.append(warn)
     _select_only(context, results)

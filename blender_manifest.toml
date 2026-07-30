@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "sculptbase"
-version = "0.3.0"
+version = "0.4.0"
 name = "SculptBase"
 tagline = "Retopo split parts into multires sculpt bases with joint guards"
 maintainer = "GarageKit <zhuwanchuanyuan@gmail.com>"
