@@ -73,7 +73,7 @@ def test_convert():
     st.joint_distance = 0.02
     st.separate_joints = True
     st.joint_margin = 0.3
-    st.union_depth = 0.02
+    st.joint_blend = 0.02
     st.keep_source = True
 
     result = bpy.ops.sculptbase.convert()
@@ -278,7 +278,7 @@ def test_socket_not_filled():
     st.joint_distance = 0.02
     st.separate_joints = True
     st.joint_margin = 0.15
-    st.union_depth = 0.0               # 自動
+    st.joint_blend = 0.02
     st.keep_source = False
 
     box.select_set(True)
@@ -313,6 +313,55 @@ def test_socket_not_filled():
     if not _is_open(out, probe_z):
         _fail("SOCKET WAS FILLED IN — the dowel hole disappeared")
     print("  socket still hollow after finalize, output watertight")
+
+
+def test_cap_marking():
+    """蓋(CAP_LAYER)が実際に記録され、三角化されることを検証する。
+
+    実データで発生した回帰: holes_fill が境界ループ全体を1枚の巨大 n-gon
+    で塞ぎ、さらに蓋の記録が全て 0 になっていたため、統合時の押し出しが
+    一度も走らずベース側の蓋と完全に重なってブーリアンが破綻していた。
+    """
+    print("== cap faces are marked and triangulated ==")
+    import bmesh
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=48, ring_count=24, radius=1)
+    obj = bpy.context.active_object
+    # 上部のキャップを削って大きな境界ループを作る
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    doomed = [f for f in bm.faces if f.calc_center_median().z > 0.55]
+    bmesh.ops.delete(bm, geom=doomed, context='FACES')
+    bm.to_mesh(obj.data)
+    bm.free()
+    n_before = len(obj.data.polygons)
+    n_bnd = core.count_boundary_edges(obj.data)
+    if n_bnd < 20:
+        _fail("test setup: expected a large boundary loop")
+
+    n_cap = core.fill_holes_mesh(obj.data, cap_layer=core.CAP_LAYER)
+    if core.count_boundary_edges(obj.data) != 0:
+        _fail("mesh not closed after fill")
+    if n_cap < 3:
+        _fail("cap face count implausible: {}".format(n_cap))
+
+    attr = obj.data.attributes.get(core.CAP_LAYER)
+    if attr is None:
+        _fail("cap attribute missing")
+    marked = sum(1 for d in attr.data if d.value)
+    if marked != n_cap:
+        _fail("cap faces marked {} but {} were created".format(
+            marked, n_cap))
+    if marked == 0:
+        _fail("NO cap faces were marked — extrusion would never run")
+    # 巨大 n-gon ではなく三角形になっていること
+    cap_sizes = {len(p.vertices) for p, d in
+                 zip(obj.data.polygons, attr.data) if d.value}
+    if cap_sizes != {3}:
+        _fail("cap faces are not triangles: sizes {}".format(cap_sizes))
+    print("  boundary {} edges -> {} triangular cap faces, all marked".format(
+        n_bnd, marked))
+    print("  faces {} -> {}".format(n_before, len(obj.data.polygons)))
 
 
 def test_holes_fill_fallback():
@@ -382,6 +431,8 @@ def main():
         test_finalize()
         print()
         test_socket_not_filled()
+        print()
+        test_cap_marking()
         print()
         test_holes_fill_fallback()
         print()

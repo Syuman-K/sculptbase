@@ -61,14 +61,12 @@ class SculptBaseSettings(PropertyGroup):
         description="接合部を分離する際、判定距離にこの量を足した範囲まで"
                     "スカートとして含める。広いほどブーリアン統合が確実に"
                     "なるが、その分スカルプトできない領域が増える")
-    union_depth: FloatProperty(
-        name="押し出し深さ",
-        default=0.0, min=0.0, soft_max=0.05, precision=5, unit='LENGTH',
-        description="出力統合時、接合部チャンクの「蓋」をこの深さだけ"
-                    "押し出して角柱にする。蓋がベース表面と同一面で重なると"
-                    "ブーリアンが退化して穴が空くのを防ぐ。押し出し方向は"
-                    "ダボなら本体内部、ダボ穴なら外側の空間なので出力表面"
-                    "には現れない。0 で自動(接合部サイズの2%)")
+    joint_blend: FloatProperty(
+        name="なじませ幅",
+        default=0.004, min=0.0, soft_max=0.1, precision=4, unit='LENGTH',
+        description="出力時、接合部(完全にソースのまま)から造形面へ"
+                    "切り替わる遷移帯の幅。ここを 0 にすると境目に段差が"
+                    "出ることがある")
     verify_joints: BoolProperty(
         name="統合後に接合部を検証", default=True,
         description="出力統合のあと、接合部の形状がソース(SB_Source に"
@@ -79,7 +77,9 @@ class SculptBaseSettings(PropertyGroup):
         name="ソースを退避して残す", default=True,
         description="変換後の高密度ソースを SB_Source コレクションに移して"
                     "ビューレイヤーから除外する(依存グラフの評価対象外に"
-                    "なるため重くならない)。無効なら削除する")
+                    "なるため重くならない)。無効なら削除するが、"
+                    "「接合部の原形を保持」が有効なときは出力時にダボを"
+                    "厳密復元する土台として必ず保持される")
 
 
 class _ProgressModal:
