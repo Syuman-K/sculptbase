@@ -88,7 +88,9 @@ def test_convert():
 
     st = bpy.context.scene.sculptbase
     st.engine = 'QUADRIFLOW'
-    st.target_faces = 1000
+    st.density_mode = 'MANUAL'
+    st.edge_length = 0.12
+    st.min_faces = 200
     st.levels = 2
     st.joint_distance = 0.02
     st.separate_joints = True
@@ -212,6 +214,82 @@ def test_finalize():
           "base+joint stashed".format(len(out.data.polygons)))
 
 
+def test_area_proportional_density():
+    """ベース密度が面積比例になり、パーツ間で面あたり密度が揃うこと。
+
+    従来はパーツごとに固定面数だったため、小さいパーツほど過密・
+    大きいパーツほど粗くなっていた(eula 実データで小物が必要量の
+    3倍以上の面数になっていた)。
+    """
+    print("== base density is proportional to surface area ==")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    # 一辺 4 と 1 の立方体(表面積比 16:1)
+    bpy.ops.mesh.primitive_cube_add(size=4, location=(0, 0, 0))
+    big = bpy.context.active_object
+    big.name = "big"
+    bpy.ops.mesh.primitive_cube_add(size=1, location=(10, 0, 0))
+    small = bpy.context.active_object
+    small.name = "small"
+
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.density_mode = 'MANUAL'
+    st.edge_length = 0.2
+    st.min_faces = 4
+
+    bases, edge = core.estimate_bases(st, [big, small])
+    got = {o.name: n for o, n in bases}
+    # 表面積: big = 6*4^2 = 96, small = 6 -> 面数比は 16:1 になるはず
+    exp_big = round(96 / (0.2 ** 2))
+    exp_small = round(6 / (0.2 ** 2))
+    if abs(got["big"] - exp_big) > 2 or abs(got["small"] - exp_small) > 2:
+        _fail("target faces not area-proportional: {} (expected ~{}/{})".format(
+            got, exp_big, exp_small))
+    ratio = got["big"] / got["small"]
+    if abs(ratio - 16.0) > 0.5:
+        _fail("face-count ratio {:.2f} should track the 16:1 area ratio"
+              .format(ratio))
+    print("  edge {:.3f}: big {:,} faces / small {:,} faces (比 {:.1f})".format(
+        edge, got["big"], got["small"], ratio))
+
+    # 予算モード: 合計面数が予算に収まり、配分は面積比になる
+    st.density_mode = 'BUDGET'
+    st.base_budget = 5100
+    st.min_faces = 4
+    bases, edge_budget = core.estimate_bases(st, [big, small])
+    total = sum(n for _o, n in bases)
+    if abs(total - 5100) > 5100 * 0.02:
+        _fail("budget not honoured: {} vs 5100".format(total))
+    got = {o.name: n for o, n in bases}
+    if abs(got["big"] / got["small"] - 16.0) > 0.5:
+        _fail("budget split is not area-proportional: {}".format(got))
+    print("  予算 5,100 面 -> 合計 {:,} 面 (big {:,} / small {:,}), "
+          "エッジ長 {:.3f}".format(total, got["big"], got["small"],
+                                   edge_budget))
+
+    # 予算方式は「選んだものへ配分する」ので、対象が増えれば1個あたりは
+    # 粗くなる。合計が予算に収まり続けることを確認しておく。
+    bpy.ops.mesh.primitive_cube_add(size=60, location=(0, 0, 200))
+    stray = bpy.context.active_object
+    stray.name = "stray_helper"
+    bases3, _e = core.estimate_bases(st, [big, small, stray])
+    total3 = sum(n for _o, n in bases3)
+    if abs(total3 - 5100) > 5100 * 0.05:
+        _fail("budget not honoured with 3 objects: {}".format(total3))
+    print("  対象が増えても合計は予算内: {:,} 面".format(total3))
+    bpy.data.objects.remove(stray, do_unlink=True)
+
+    # 最小面数の下限が効くこと
+    st.density_mode = 'MANUAL'
+    st.edge_length = 5.0          # 粗すぎてほぼ 0 面になる設定
+    st.min_faces = 250
+    bases, _e = core.estimate_bases(st, [big, small])
+    if any(n < 250 for _o, n in bases):
+        _fail("min_faces floor not applied: {}".format(
+            [(o.name, n) for o, n in bases]))
+    print("  最小面数 250 の下限が適用される")
+
+
 def test_refinalize():
     """造形を足して再度「出力用に統合」しても接合部が復元されること。
 
@@ -304,7 +382,9 @@ def test_no_joint_warning():
 
     st = bpy.context.scene.sculptbase
     st.engine = 'QUADRIFLOW'
-    st.target_faces = 300
+    st.density_mode = 'MANUAL'
+    st.edge_length = 0.25
+    st.min_faces = 100
     st.levels = 1
     st.joint_distance = 0.01
     st.joint_margin = 0.02
@@ -328,7 +408,9 @@ def test_no_joint_warning():
     bpy.context.view_layer.objects.active = solo
     st = bpy.context.scene.sculptbase
     st.engine = 'QUADRIFLOW'
-    st.target_faces = 300
+    st.density_mode = 'MANUAL'
+    st.edge_length = 0.25
+    st.min_faces = 100
     st.levels = 1
     st.separate_joints = True
     _r, _n, warnings = core.convert_selection(bpy.context, st)
@@ -344,7 +426,9 @@ def test_progress_stages():
     cube.select_set(True)
     st = bpy.context.scene.sculptbase
     st.engine = 'QUADRIFLOW'
-    st.target_faces = 500
+    st.density_mode = 'MANUAL'
+    st.edge_length = 0.18
+    st.min_faces = 100
     st.levels = 2
     st.joint_distance = 0.02
     st.joint_margin = 0.3
@@ -418,7 +502,9 @@ def test_socket_not_filled():
 
     st = bpy.context.scene.sculptbase
     st.engine = 'QUADRIFLOW'
-    st.target_faces = 800
+    st.density_mode = 'MANUAL'
+    st.edge_length = 0.10
+    st.min_faces = 200
     st.levels = 2
     st.joint_distance = 0.02
     st.separate_joints = True
@@ -580,6 +666,8 @@ def main():
         test_double_convert_skipped()
         print()
         test_no_joint_warning()
+        print()
+        test_area_proportional_density()
         print()
         test_socket_not_filled()
         print()

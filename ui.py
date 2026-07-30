@@ -17,6 +17,8 @@ class SCULPTBASE_PT_main(Panel):
         st = context.scene.sculptbase
         layout = self.layout
 
+        parts = [o for o in context.selected_objects if o.type == 'MESH']
+
         box = layout.box()
         box.label(text="リトポ(四角リメッシュ)", icon='MOD_REMESH')
         box.prop(st, "engine", text="")
@@ -24,17 +26,27 @@ class SCULPTBASE_PT_main(Panel):
             box.label(text="QRemeshify 導入で QuadWild が使えます",
                       icon='INFO')
         if st.engine == 'QUADRIFLOW':
-            box.prop(st, "target_faces")
+            box.prop(st, "density_mode", expand=True)
+            if st.density_mode == 'BUDGET':
+                box.prop(st, "base_budget")
+            else:
+                box.prop(st, "edge_length")
+            box.prop(st, "min_faces")
+        else:
+            box.label(text="密度は QRemeshify パネルの設定に従います",
+                      icon='INFO')
 
         box = layout.box()
         box.label(text="形状転写", icon='MOD_MULTIRES')
         box.prop(st, "levels")
-        n_parts = max(1, sum(1 for o in context.selected_objects
-                             if o.type == 'MESH'))
-        top = st.target_faces * (4 ** st.levels)
-        box.label(text="最大レベルの面数: 約 {:,} /パーツ (計 {:,})".format(
-            top, top * n_parts),
-            icon='ERROR' if top * n_parts > 4_000_000 else 'MESH_DATA')
+        if parts and st.engine == 'QUADRIFLOW':
+            bases, edge = core.estimate_bases(st, parts)
+            base_total = sum(n for _o, n in bases)
+            top = base_total * (4 ** st.levels)
+            box.label(text="エッジ長 {:.5f} / ベース計 {:,} 面".format(
+                edge, base_total))
+            box.label(text="最大レベルの面数: 計 約 {:,}".format(top),
+                      icon='ERROR' if top > 4_000_000 else 'MESH_DATA')
 
         box = layout.box()
         box.label(text="接合部保護(分割面・ダボ)", icon='LOCKED')

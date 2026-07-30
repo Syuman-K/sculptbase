@@ -110,6 +110,62 @@ def build_bvh(obj):
 
 
 # --------------------------------------------------------------------------- #
+# ベース密度(面積比例)
+# --------------------------------------------------------------------------- #
+# 1パーツあたりの面数の安全上限。面積比例で桁が跳ねてもここで止める。
+_FACE_CAP = 400_000
+
+
+def surface_area(obj):
+    """``obj`` のワールド空間での表面積。"""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.transform(obj.matrix_world)
+    area = sum(f.calc_area() for f in bm.faces)
+    bm.free()
+    return area
+
+
+def compute_edge_length(settings, objects):
+    """ベースの目標エッジ長(＝四角面1辺の狙い寸法)を決める。
+
+    これを全パーツに共通で使うことが密度統一の要。パーツごとに固定の
+    面数を割り当てると、小さいパーツほど過密・大きいパーツほど粗くなる。
+
+    自動モードは「ベース合計面数の予算」から逆算する
+    (``edge = sqrt(総表面積 / 予算)``)。最大パーツの寸法を基準にする
+    やり方は、シーンに紛れた補助オブジェクト1つで基準が大きく狂うため
+    採らない(eula の実データでは面積10万の Cube が混ざっており、
+    エッジ長が3.7倍ずれた)。
+    """
+    if settings.density_mode == 'MANUAL':
+        return max(settings.edge_length, 1e-6)
+    total = sum(surface_area(o) for o in objects)
+    budget = max(settings.base_budget, 1)
+    if total <= 0.0:
+        return max(settings.edge_length, 1e-6)
+    return max((total / budget) ** 0.5, 1e-6)
+
+
+def target_faces_for(obj, edge_length, min_faces):
+    """面積とエッジ長から ``obj`` のベース目標面数を出す。
+
+    四角面1枚の面積はおよそ ``edge_length**2`` なので、面数は
+    表面積 / edge**2。小さいパーツが潰れないよう下限を設ける。
+    """
+    area = surface_area(obj)
+    n = int(round(area / (edge_length * edge_length)))
+    return max(min_faces, min(n, _FACE_CAP))
+
+
+def estimate_bases(settings, objects):
+    """``[(オブジェクト, 目標面数), ...]`` と使用エッジ長を返す(UI/見積り用)。"""
+    edge = compute_edge_length(settings, objects)
+    return ([(o, target_faces_for(o, edge, settings.min_faces))
+             for o in objects], edge)
+
+
+# --------------------------------------------------------------------------- #
 # 四角リメッシュ エンジン
 # --------------------------------------------------------------------------- #
 def qremeshify_available():
@@ -477,7 +533,7 @@ def _remove_object(obj):
         bpy.data.meshes.remove(mesh)
 
 
-def _convert_part_stages(context, dense, settings, other_bvhs):
+def _convert_part_stages(context, dense, settings, other_bvhs, edge_length):
     """``convert_part`` の段階実行ジェネレーター。
 
     重い処理の直前に ``(パーツ内進捗 0..1, ラベル)`` を yield し、最後に
@@ -496,8 +552,11 @@ def _convert_part_stages(context, dense, settings, other_bvhs):
     transfer_src = body if joint is not None else dense
     base = duplicate_object(context, transfer_src, name=name)
 
-    yield 0.1, "四角リメッシュ"
-    quad_remesh(context, base, settings.engine, settings.target_faces)
+    # 目標面数は「表面積 ÷ エッジ長²」。エッジ長はシーン共通なので、
+    # 大きいパーツほど面が多く、面あたりの密度はパーツ間で揃う。
+    faces = target_faces_for(transfer_src, edge_length, settings.min_faces)
+    yield 0.1, "四角リメッシュ ({:,}面)".format(faces)
+    quad_remesh(context, base, settings.engine, faces)
     # リメッシュ器が閉じ損ねた場合に備えて塞ぐ(後段は水密前提)。
     filled = fill_holes_mesh(base.data)
     if filled:
@@ -540,7 +599,7 @@ def _convert_part_stages(context, dense, settings, other_bvhs):
     return base
 
 
-def convert_part(context, dense, settings, other_bvhs):
+def convert_part(context, dense, settings, other_bvhs, edge_length=None):
     """``dense`` パーツをスカルプト用ベースへ変換して返す(同期実行)。
 
     接合部の原形保持が有効で接合部が見つかった場合、ダボ+スカートは
@@ -548,7 +607,10 @@ def convert_part(context, dense, settings, other_bvhs):
     リメッシュ・転写される。``dense`` 自体は SB_Source に退避される
     (keep_source が偽なら削除)。結果オブジェクトは元の名前を引き継ぐ。
     """
-    gen = _convert_part_stages(context, dense, settings, other_bvhs)
+    if edge_length is None:
+        edge_length = compute_edge_length(settings, [dense])
+    gen = _convert_part_stages(context, dense, settings, other_bvhs,
+                               edge_length)
     while True:
         try:
             next(gen)
@@ -858,6 +920,8 @@ def iter_convert(context, settings):
             "パーツが1個だけなので接合部を検出できません。ダボを厳密に"
             "保持するには、噛み合う相手のパーツも一緒に選択してください")
 
+    edge_length = compute_edge_length(settings, parts)
+    print("[SculptBase] ベースのエッジ長: {:.5f}".format(edge_length))
     bvhs = {o: build_bvh(o) for o in parts}
     results = []
     total_protected = 0
@@ -865,7 +929,8 @@ def iter_convert(context, settings):
     for i, dense in enumerate(parts):
         others = [bvh for o, bvh in bvhs.items()
                   if o is not dense and bvh is not None]
-        gen = _convert_part_stages(context, dense, settings, others)
+        gen = _convert_part_stages(context, dense, settings, others,
+                                   edge_length)
         base = None
         while base is None:
             try:

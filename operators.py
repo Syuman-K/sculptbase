@@ -31,12 +31,33 @@ class SculptBaseSettings(PropertyGroup):
         name="リメッシュエンジン",
         items=_engine_items,
     )
-    target_faces: IntProperty(
-        name="目標四角面数",
-        default=8000, min=100, soft_max=200000,
-        description="ベースメッシュの目標面数(QuadriFlow エンジン時)。"
-                    "実効面数は Multires レベルごとに4倍になるので、"
-                    "レベル3なら64倍。大きすぎると変換も統合も重くなる")
+    density_mode: EnumProperty(
+        name="ベース密度",
+        items=[
+            ('BUDGET', "合計面数から",
+             "ベース合計面数の予算を決め、そこからエッジ長を逆算して"
+             "各パーツへ表面積の比で配分する。全体の重さを直接指定できる"),
+            ('MANUAL', "エッジ長を指定",
+             "四角面1辺の目標長さを実寸で直接指定する"),
+        ],
+        default='BUDGET')
+    base_budget: IntProperty(
+        name="ベース合計面数",
+        default=200000, min=100, soft_max=1000000,
+        description="選択パーツ全体のベース面数の目安。表面積の比で各パーツ"
+                    "へ配分するので、パーツの大小によらず面あたりの密度が"
+                    "揃う。実効面数はここに Multires レベル分(4^レベル)が"
+                    "掛かる")
+    edge_length: FloatProperty(
+        name="エッジ長",
+        default=0.01, min=1e-5, soft_max=1.0, precision=5, unit='LENGTH',
+        description="四角面1辺の目標長さ(実寸)。シーンの単位を出力サイズに"
+                    "合わせておけば、これがそのままベースの目の細かさになる")
+    min_faces: IntProperty(
+        name="最小面数",
+        default=200, min=4, soft_max=20000,
+        description="小さいパーツがこの面数を下回らないようにする"
+                    "(密度統一の例外。細かい小物が潰れるのを防ぐ)")
     levels: IntProperty(
         name="Multires レベル",
         default=2, min=1, max=6,
