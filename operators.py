@@ -46,6 +46,19 @@ class SculptBaseSettings(PropertyGroup):
         default=0.001, min=0.0, soft_max=0.1, precision=4, unit='LENGTH',
         description="他パーツの表面からこの距離以内の頂点を接合部"
                     "(分割面・ダボ)としてマスク保護する")
+    separate_joints: BoolProperty(
+        name="接合部の原形を保持", default=True,
+        description="接合部(ダボ+周辺スカート)をリメッシュ前に"
+                    "「<名前>_joint」として分離し、元のジオメトリを1頂点も"
+                    "変えずに保持する。リメッシュ+転写の近似でダボが崩れる"
+                    "のを防ぐ。出力時に「出力用に統合」で本体と exact "
+                    "ブーリアン統合される")
+    joint_margin: FloatProperty(
+        name="分離マージン",
+        default=0.003, min=0.0, soft_max=0.1, precision=4, unit='LENGTH',
+        description="接合部を分離する際、判定距離にこの量を足した範囲まで"
+                    "スカートとして含める。広いほどブーリアン統合が確実に"
+                    "なるが、その分スカルプトできない領域が増える")
     keep_source: BoolProperty(
         name="ソースを退避して残す", default=True,
         description="変換後の高密度ソースを SB_Source コレクションに移して"
@@ -115,10 +128,42 @@ class SCULPTBASE_OT_remask(Operator):
         return {'FINISHED'}
 
 
+class SCULPTBASE_OT_finalize(Operator):
+    bl_idname = "sculptbase.finalize"
+    bl_label = "出力用に統合"
+    bl_description = ("選択中の変換済みベースの Multires をトップレベルで"
+                     "適用し、分離してあった接合部(_joint)を exact "
+                     "ブーリアンで統合した出力メッシュを作る。ベースと "
+                     "_joint は SB_Sculpt に退避され再編集できる")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.get(core.RESULT_TAG) for o in context.selected_objects)
+
+    def execute(self, context):
+        try:
+            results, warnings = core.finalize_selection(context)
+        except RuntimeError as exc:
+            self.report({'WARNING'}, str(exc))
+            return {'CANCELLED'}
+        except Exception as exc:  # noqa: BLE001 - surface any failure
+            self.report({'ERROR'}, "SculptBase 統合失敗: {}".format(exc))
+            return {'CANCELLED'}
+        for warn in warnings:
+            self.report({'WARNING'}, warn)
+        self.report(
+            {'INFO'},
+            "SculptBase: {} パーツを出力用に統合しました"
+            "(PhasePorter で print_ へ移行できます)".format(len(results)))
+        return {'FINISHED'}
+
+
 CLASSES = (
     SculptBaseSettings,
     SCULPTBASE_OT_convert,
     SCULPTBASE_OT_remask,
+    SCULPTBASE_OT_finalize,
 )
 
 

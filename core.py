@@ -21,6 +21,14 @@
    頂点グループ・フェイスセットの三重で保護する。スカルプトブラシは
    マスク済み頂点を動かせないため、ダボを崩す事故を機械的に防ぐ。
 
+接合部の原形保持(v0.2.0〜, 既定 ON):
+   リメッシュ + Catmull-Clark 転写は近似なので、ダボのような小さく鋭い
+   形状は僅かに崩れる。これを許容しないため、接合部(ダボ + 周辺スカート)
+   の面をリメッシュ前に「<名前>_joint」オブジェクトへ分離し、元の
+   ジオメトリを 1 頂点も変えずに保持する。本体側は穴を塞いでから
+   リメッシュ・転写する。出力時(finalize)に Multires を適用した本体と
+   _joint を exact ブーリアンで統合し、ダボはビット単位で元のまま出力される。
+
 UI に依存しない関数のみを置き、ヘッドレステストから直接呼べるようにする。
 """
 
@@ -30,9 +38,13 @@ from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
 RESULT_TAG = "sculptbase_result"
+JOINT_TAG = "sculptbase_joint"
+FINAL_TAG = "sculptbase_final"
 JOINT_GROUP = "SB_JointGuard"
 SOURCE_COLLECTION = "SB_Source"
+SCULPT_COLLECTION = "SB_Sculpt"
 MULTIRES_NAME = "SB_Multires"
+JOINT_SUFFIX = "_joint"
 
 
 # --------------------------------------------------------------------------- #
@@ -180,6 +192,78 @@ def _base_level_mesh(base):
 
 
 # --------------------------------------------------------------------------- #
+# 接合部の分離(原形保持)
+# --------------------------------------------------------------------------- #
+def fill_holes_mesh(mesh):
+    """境界ループ(穴)を面で塞ぐ。塞いだ面の数を返す。"""
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    boundary = [e for e in bm.edges if e.is_boundary]
+    if not boundary:
+        bm.free()
+        return 0
+    result = bmesh.ops.holes_fill(bm, edges=boundary, sides=0)
+    n = len(result.get("faces", ()))
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    return n
+
+
+def count_boundary_edges(mesh):
+    """境界エッジ数(0 なら水密の必要条件を満たす)。"""
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    n = sum(1 for e in bm.edges if e.is_boundary)
+    bm.free()
+    return n
+
+
+def _faces_subset_object(context, src, face_indices, keep, name):
+    """``src`` のコピーから面集合の片側だけを残したオブジェクトを作る。
+
+    ``keep`` が真なら ``face_indices`` の面を残し、偽なら取り除く。
+    残った境界の穴は塞いで水密なソリッドにする。
+    """
+    obj = duplicate_object(context, src, name=name)
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    doomed = [f for f in bm.faces if (f.index in face_indices) != keep]
+    bmesh.ops.delete(bm, geom=doomed, context='FACES')
+    loose = [v for v in bm.verts if not v.link_faces]
+    if loose:
+        bmesh.ops.delete(bm, geom=loose, context='VERTS')
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+    fill_holes_mesh(obj.data)
+    return obj
+
+
+def separate_joint(context, dense, other_bvhs, distance):
+    """``dense`` の接合部(ダボ+スカート)と本体を分けたコピーを返す。
+
+    他パーツ表面から ``distance`` 以内の頂点を含む面を接合部とみなす。
+    ``(body, joint)`` を返す。接合部が無い(または全面が接合部)場合は
+    ``(None, None)``。``dense`` 自体は変更しない。
+    """
+    mesh = dense.data
+    near = joint_vertex_indices(dense, other_bvhs, distance)
+    if not near:
+        return None, None
+    joint_faces = {p.index for p in mesh.polygons
+                   if any(v in near for v in p.vertices)}
+    if not joint_faces or len(joint_faces) == len(mesh.polygons):
+        return None, None
+    body = _faces_subset_object(context, dense, joint_faces, False,
+                                dense.name + "_bodytmp")
+    joint = _faces_subset_object(context, dense, joint_faces, True,
+                                 dense.name + "_jointtmp")
+    return body, joint
+
+
+# --------------------------------------------------------------------------- #
 # 接合部(分割面・ダボ)の検出と保護
 # --------------------------------------------------------------------------- #
 def joint_vertex_indices(obj, other_bvhs, distance):
@@ -228,15 +312,15 @@ def protect_joints(obj, joint_verts):
 # --------------------------------------------------------------------------- #
 # ソース退避
 # --------------------------------------------------------------------------- #
-def stash_source(context, obj):
-    """``obj`` を SB_Source コレクションへ移し、ビューレイヤーから除外する。
+def stash_source(context, obj, coll_name=SOURCE_COLLECTION):
+    """``obj`` を退避コレクションへ移し、ビューレイヤーから除外する。
 
     除外されたコレクションは依存グラフの評価対象外になるため、高密度
     ソースがシーンに残っていても操作を重くしない。
     """
-    coll = bpy.data.collections.get(SOURCE_COLLECTION)
+    coll = bpy.data.collections.get(coll_name)
     if coll is None:
-        coll = bpy.data.collections.new(SOURCE_COLLECTION)
+        coll = bpy.data.collections.new(coll_name)
         context.scene.collection.children.link(coll)
     for c in list(obj.users_collection):
         c.objects.unlink(obj)
@@ -259,33 +343,121 @@ def stash_source(context, obj):
 # --------------------------------------------------------------------------- #
 # パーツ変換(1個分のフルパイプライン)
 # --------------------------------------------------------------------------- #
+def _remove_object(obj):
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
 def convert_part(context, dense, settings, other_bvhs):
     """``dense`` パーツをスカルプト用ベースへ変換して返す。
 
-    ``dense`` 自体は SB_Source コレクションに退避される(keep_source が
-    偽なら削除)。結果オブジェクトは元の名前を引き継ぐ。
+    接合部の原形保持が有効で接合部が見つかった場合、ダボ+スカートは
+    「<名前>_joint」として元ジオメトリのまま分離され、本体だけが
+    リメッシュ・転写される。``dense`` 自体は SB_Source に退避される
+    (keep_source が偽なら削除)。結果オブジェクトは元の名前を引き継ぐ。
     """
     name = dense.name
     dense.name = name + "_src"
-    base = duplicate_object(context, dense, name=name)
+
+    body = joint = None
+    if getattr(settings, "separate_joints", True):
+        body, joint = separate_joint(
+            context, dense, other_bvhs,
+            settings.joint_distance + settings.joint_margin)
+
+    transfer_src = body if joint is not None else dense
+    base = duplicate_object(context, transfer_src, name=name)
 
     quad_remesh(context, base, settings.engine, settings.target_faces)
-    transfer_to_multires(context, base, dense, settings.levels)
+    transfer_to_multires(context, base, transfer_src, settings.levels)
 
-    joints = joint_vertex_indices(base, other_bvhs, settings.joint_distance)
+    # 接合部チャンク自身も保護対象に含めてベースをマスクする。
+    guard_bvhs = list(other_bvhs)
+    if joint is not None:
+        jb = build_bvh(joint)
+        if jb is not None:
+            guard_bvhs.append(jb)
+    joints = joint_vertex_indices(base, guard_bvhs, settings.joint_distance)
     n_protected = protect_joints(base, joints)
 
+    if joint is not None:
+        joint.name = name + JOINT_SUFFIX
+        joint.data.name = joint.name
+        joint[JOINT_TAG] = True
+        _remove_object(body)                 # 転写targetの本体コピーは破棄
     if settings.keep_source:
         stash_source(context, dense)
     else:
-        mesh = dense.data
-        bpy.data.objects.remove(dense, do_unlink=True)
-        if mesh.users == 0:
-            bpy.data.meshes.remove(mesh)
+        _remove_object(dense)
 
     base[RESULT_TAG] = True
     base["sculptbase_protected_verts"] = n_protected
     return base
+
+
+# --------------------------------------------------------------------------- #
+# 出力用の統合(Multires 適用 + 接合部ブーリアン)
+# --------------------------------------------------------------------------- #
+def finalize_part(context, base):
+    """``base`` の Multires を適用し、_joint と統合した出力メッシュを返す。
+
+    ベースと _joint は SB_Sculpt コレクションへ退避され(再編集用に温存)、
+    出力オブジェクトが元の名前を引き継ぐ。接合部は exact ブーリアンで
+    統合されるため、ダボのジオメトリは元のまま出力される。
+    """
+    name = base.name
+    joint = bpy.data.objects.get(name + JOINT_SUFFIX)
+
+    out = duplicate_object(context, base, name=name + "_out_tmp")
+    mr = out.modifiers.get(MULTIRES_NAME)
+    if mr is not None:
+        mr.levels = mr.sculpt_levels or mr.total_levels
+    _bake_evaluated(context, out)
+
+    warn = None
+    if joint is not None:
+        mod = out.modifiers.new("SB_Union", 'BOOLEAN')
+        mod.operation = 'UNION'
+        mod.solver = 'EXACT'
+        mod.object = joint
+        _bake_evaluated(context, out)
+    if count_boundary_edges(out.data) != 0:
+        warn = "'{}' の出力メッシュに境界エッジが残っています".format(name)
+
+    base.name = name + "_sculpt"
+    stash_source(context, base, SCULPT_COLLECTION)
+    if joint is not None:
+        stash_source(context, joint, SCULPT_COLLECTION)
+    out.name = name
+    out.data.name = name
+    out[FINAL_TAG] = True
+    if RESULT_TAG in out:
+        del out[RESULT_TAG]
+    return out, warn
+
+
+def finalize_selection(context):
+    """選択中の変換済みベースを一括で出力用に統合する。"""
+    bases = [o for o in context.selected_objects if o.get(RESULT_TAG)]
+    if not bases:
+        raise RuntimeError(
+            "変換済みのベース(スカルプトベースに変換した結果)を選択してください。")
+    results = []
+    warnings = []
+    for base in bases:
+        out, warn = finalize_part(context, base)
+        results.append(out)
+        if warn:
+            warnings.append(warn)
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    for obj in results:
+        obj.select_set(True)
+    if results:
+        context.view_layer.objects.active = results[0]
+    return results, warnings
 
 
 def convert_selection(context, settings):

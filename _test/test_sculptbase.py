@@ -23,8 +23,15 @@ def _fail(msg):
     raise SystemExit(1)
 
 
+DOWEL_CORNER = (1.35, 0.15, 0.15)   # ダボ先端の正確な角座標(保持の検証に使う)
+
+
 def _make_parts():
-    """細かい球(パーツA)と、表面に食い込む立方体(パーツB)を作る。"""
+    """ダボ付きの球(パーツA)と、ダボを受ける立方体(パーツB)を作る。
+
+    パーツAは球 + ダボ(小さな直方体, x 1.05..1.35)を結合したもの。
+    パーツBはダボ先端が食い込む位置に置いた立方体。
+    """
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.mesh.primitive_uv_sphere_add(segments=64, ring_count=32, radius=1)
     sphere = bpy.context.active_object
@@ -32,10 +39,24 @@ def _make_parts():
     sphere.scale = (1.0, 1.0, 1.4)
     bpy.ops.object.transform_apply(scale=True)
 
-    bpy.ops.mesh.primitive_cube_add(size=0.6, location=(1.05, 0, 0))
+    bpy.ops.mesh.primitive_cube_add(size=0.3, location=(1.2, 0, 0))
+    dowel = bpy.context.active_object
+    with bpy.context.temp_override(active_object=sphere,
+                                   selected_editable_objects=[sphere, dowel]):
+        bpy.ops.object.join()
+    sphere = bpy.data.objects["part_A"]
+
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(1.8, 0, 0))
     cube = bpy.context.active_object
     cube.name = "part_B"
     return sphere, cube
+
+
+def _has_exact_vertex(obj, target, tol=1e-6):
+    from mathutils import Vector
+    t = Vector(target)
+    mw = obj.matrix_world
+    return any((mw @ v.co - t).length < tol for v in obj.data.vertices)
 
 
 def test_convert():
@@ -50,6 +71,8 @@ def test_convert():
     st.target_faces = 1000
     st.levels = 2
     st.joint_distance = 0.02
+    st.separate_joints = True
+    st.joint_margin = 0.3
     st.keep_source = True
 
     result = bpy.ops.sculptbase.convert()
@@ -74,18 +97,30 @@ def test_convert():
     if mr is None or mr.type != 'MULTIRES' or mr.sculpt_levels != 2:
         _fail("multires missing or wrong levels")
 
-    # 形状転写の確認: トップレベル評価時の寸法が元とほぼ一致する
+    # 形状転写の確認: 本体(ダボ抜き)のY/Z寸法が元とほぼ一致する
     mr.levels = 2
     bpy.context.view_layer.update()
     depsgraph = bpy.context.evaluated_depsgraph_get()
     dims = base.evaluated_get(depsgraph).dimensions
-    for i in range(3):
+    for i in (1, 2):
         if abs(dims[i] - dense_dims[i]) / dense_dims[i] > 0.05:
             _fail("transferred shape deviates: {} vs {}".format(
                 tuple(dims), tuple(dense_dims)))
     print("  multires L2 dims {} ~= source {}".format(
         tuple(round(d, 3) for d in dims),
         tuple(round(d, 3) for d in dense_dims)))
+
+    # 接合部の原形保持: _joint にダボ先端の角が1頂点も動かず残っている
+    joint = bpy.data.objects.get("part_A_joint")
+    if joint is None:
+        _fail("part_A_joint was not created")
+    if not joint.get(core.JOINT_TAG):
+        _fail("joint object not tagged")
+    if core.count_boundary_edges(joint.data) != 0:
+        _fail("joint chunk is not watertight")
+    if not _has_exact_vertex(joint, DOWEL_CORNER):
+        _fail("exact dowel corner missing from joint chunk")
+    print("  joint chunk: watertight, dowel corner preserved exactly")
 
     # 接合部保護: 立方体と接する側の頂点がマスクされている
     vg = base.vertex_groups.get(core.JOINT_GROUP)
@@ -124,6 +159,38 @@ def test_convert():
     print("  sources stashed in excluded {}".format(core.SOURCE_COLLECTION))
 
 
+def test_finalize():
+    print("== finalize: multires apply + exact joint union ==")
+    base = bpy.data.objects["part_A"]
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    base.select_set(True)
+    bpy.context.view_layer.objects.active = base
+
+    result = bpy.ops.sculptbase.finalize()
+    if result != {'FINISHED'}:
+        _fail("finalize returned {}".format(result))
+
+    out = bpy.data.objects.get("part_A")
+    if out is None or not out.get(core.FINAL_TAG):
+        _fail("finalized object missing or untagged")
+    if out.modifiers:
+        _fail("finalized object still has modifiers")
+    if core.count_boundary_edges(out.data) != 0:
+        _fail("finalized mesh is not watertight")
+    if not _has_exact_vertex(out, DOWEL_CORNER):
+        _fail("exact dowel corner missing from finalized mesh")
+    if len(out.data.polygons) < 10000:
+        _fail("finalized mesh unexpectedly coarse ({} polys)".format(
+            len(out.data.polygons)))
+    sculpt_coll = bpy.data.collections.get(core.SCULPT_COLLECTION)
+    if sculpt_coll is None or "part_A_sculpt" not in sculpt_coll.objects \
+            or "part_A_joint" not in sculpt_coll.objects:
+        _fail("base/joint were not stashed into SB_Sculpt")
+    print("  output: watertight, {} polys, dowel corner exact, "
+          "base+joint stashed".format(len(out.data.polygons)))
+
+
 def test_remask():
     print("== remask on plain meshes ==")
     bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -160,6 +227,8 @@ def main():
     addon.register()
     try:
         test_convert()
+        print()
+        test_finalize()
         print()
         test_remask()
     finally:
