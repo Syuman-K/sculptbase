@@ -52,6 +52,26 @@ def _make_parts():
     return sphere, cube
 
 
+def _unexclude(coll_name):
+    """退避コレクションをビューレイヤーに戻す(選択できるようにする)。"""
+    coll = bpy.data.collections.get(coll_name)
+    if coll is None:
+        return
+
+    def _find(layer):
+        if layer.collection == coll:
+            return layer
+        for child in layer.children:
+            f = _find(child)
+            if f:
+                return f
+        return None
+
+    layer = _find(bpy.context.view_layer.layer_collection)
+    if layer:
+        layer.exclude = False
+
+
 def _has_exact_vertex(obj, target, tol=1e-6):
     from mathutils import Vector
     t = Vector(target)
@@ -192,6 +212,131 @@ def test_finalize():
           "base+joint stashed".format(len(out.data.polygons)))
 
 
+def test_refinalize():
+    """造形を足して再度「出力用に統合」しても接合部が復元されること。
+
+    回帰: 初回統合でベース名が <パーツ名>_sculpt に変わるため、名前から
+    _joint / _src を引いていた頃は2回目で両方見失い、警告も出さずに
+    ダボがリメッシュ精度の出力になっていた。
+    """
+    print("== re-finalize after more sculpting ==")
+    base = bpy.data.objects.get("part_A_sculpt")
+    if base is None:
+        _fail("stashed base part_A_sculpt not found")
+    if not base.get(core.RESULT_TAG):
+        _fail("stashed base lost its result tag")
+    if base.get(core.PART_PROP) != "part_A":
+        _fail("part id missing on stashed base: {}".format(
+            base.get(core.PART_PROP)))
+
+    # SB_Sculpt を選択可能に戻す(通常はユーザがチェックを外す操作)
+    _unexclude(core.SCULPT_COLLECTION)
+
+    first_out = bpy.data.objects.get("part_A")
+    if first_out is None or not first_out.get(core.FINAL_TAG):
+        _fail("first output missing")
+    n_objs = len([o for o in bpy.data.objects if o.type == 'MESH'])
+
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    base.select_set(True)
+    bpy.context.view_layer.objects.active = base
+    result = bpy.ops.sculptbase.finalize()
+    if result != {'FINISHED'}:
+        _fail("re-finalize returned {}".format(result))
+
+    out = bpy.data.objects.get("part_A")
+    if out is None or not out.get(core.FINAL_TAG):
+        _fail("re-finalize did not produce part_A")
+    if not _has_exact_vertex(out, DOWEL_CORNER):
+        _fail("RE-FINALIZE LOST THE EXACT DOWEL — joint was not found")
+    if core.count_boundary_edges(out.data) != 0:
+        _fail("re-finalized mesh is not watertight")
+    # 前回出力は置き換えられ、part_A.001 のような複製が増えていないこと
+    if bpy.data.objects.get("part_A.001") is not None:
+        _fail("re-finalize duplicated the output instead of replacing it")
+    if base.name != "part_A_sculpt":
+        _fail("base name drifted to {}".format(base.name))
+    now = len([o for o in bpy.data.objects if o.type == 'MESH'])
+    if now != n_objs:
+        _fail("object count changed {} -> {}".format(n_objs, now))
+    print("  dowel still exact, output replaced in place, names stable")
+
+
+def test_double_convert_skipped():
+    """変換済みを再変換しないこと(名前が _src_src_src に壊れる回帰)。"""
+    print("== converting already-converted parts is skipped ==")
+    _unexclude(core.SCULPT_COLLECTION)
+    bases = [o for o in bpy.data.objects
+             if o.get(core.RESULT_TAG) and o.name in bpy.context.scene.objects]
+    if not bases:
+        _fail("no converted bases to test with")
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    for o in bases:
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = bases[0]
+    names_before = {o.name for o in bpy.data.objects}
+
+    result = bpy.ops.sculptbase.convert()
+    if result != {'CANCELLED'}:
+        _fail("expected CANCELLED for an all-converted selection, got "
+              "{}".format(result))
+    if {o.name for o in bpy.data.objects} != names_before:
+        _fail("objects changed even though conversion should be skipped")
+    if any("_src_src" in n for n in names_before):
+        _fail("name corruption present")
+    print("  {} converted parts skipped, no objects touched".format(
+        len(bases)))
+
+
+def test_no_joint_warning():
+    """接合部が見つからない配置では警告を出すこと。"""
+    print("== warns when parts are not in assembled position ==")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, radius=1)
+    a = bpy.context.active_object
+    a.name = "far_A"
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, radius=1,
+                                         location=(20, 0, 0))
+    b = bpy.context.active_object
+    b.name = "far_B"
+
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.target_faces = 300
+    st.levels = 1
+    st.joint_distance = 0.01
+    st.joint_margin = 0.02
+    st.separate_joints = True
+
+    a.select_set(True)
+    b.select_set(True)
+    bpy.context.view_layer.objects.active = a
+    results, _n, warnings = core.convert_selection(bpy.context, st)
+    if not any("接合部が見つかりません" in w for w in warnings):
+        _fail("no warning about missing joints: {}".format(warnings))
+    if any(o.get(core.HAS_JOINT_PROP) for o in results):
+        _fail("joints should not have been found for separated parts")
+    print("  warned: {}".format(warnings[-1][:48] + "..."))
+
+    # 単体選択でも注意を出す
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, radius=1)
+    solo = bpy.context.active_object
+    solo.select_set(True)
+    bpy.context.view_layer.objects.active = solo
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.target_faces = 300
+    st.levels = 1
+    st.separate_joints = True
+    _r, _n, warnings = core.convert_selection(bpy.context, st)
+    if not any("1個" in w for w in warnings):
+        _fail("no warning for a single-part selection: {}".format(warnings))
+    print("  single-part selection also warned")
+
+
 def test_progress_stages():
     print("== progress stages reported ==")
     sphere, cube = _make_parts()
@@ -206,7 +351,7 @@ def test_progress_stages():
     st.keep_source = False
 
     seen = []
-    gen = core.iter_convert(bpy.context, st)
+    gen = core.iter_convert(bpy.context, st)  # noqa: これは段階実行の検証
     while True:
         try:
             frac, label = next(gen)
@@ -429,6 +574,12 @@ def main():
         test_convert()
         print()
         test_finalize()
+        print()
+        test_refinalize()
+        print()
+        test_double_convert_skipped()
+        print()
+        test_no_joint_warning()
         print()
         test_socket_not_filled()
         print()

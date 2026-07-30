@@ -176,7 +176,9 @@ class SCULPTBASE_OT_convert(_ProgressModal, Operator):
         return core.iter_convert(context, settings)
 
     def _report_done(self, value):
-        results, n_protected = value
+        results, n_protected, warnings = value
+        for warn in warnings:
+            self.report({'WARNING'}, "SculptBase: " + warn)
         self.report(
             {'INFO'},
             "SculptBase: {} パーツを変換, 接合部 {} 頂点をマスク保護".format(

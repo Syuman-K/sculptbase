@@ -50,6 +50,11 @@ from mathutils.bvhtree import BVHTree
 RESULT_TAG = "sculptbase_result"
 JOINT_TAG = "sculptbase_joint"
 FINAL_TAG = "sculptbase_final"
+# パーツの識別子。オブジェクト名は工程ごとに変わる(foo -> foo_sculpt)ので、
+# 関連オブジェクト(_joint / _src)を引くときは名前ではなくこれを使う。
+PART_PROP = "sculptbase_part"
+HAS_JOINT_PROP = "sculptbase_has_joint"
+SCULPT_SUFFIX = "_sculpt"
 JOINT_GROUP = "SB_JointGuard"
 SOURCE_COLLECTION = "SB_Source"
 SCULPT_COLLECTION = "SB_Sculpt"
@@ -529,6 +534,8 @@ def _convert_part_stages(context, dense, settings, other_bvhs):
         _remove_object(dense)
 
     base[RESULT_TAG] = True
+    base[PART_PROP] = name
+    base[HAS_JOINT_PROP] = joint is not None
     base["sculptbase_protected_verts"] = n_protected
     return base
 
@@ -710,7 +717,13 @@ def finalize_part(context, base, settings):
     出力オブジェクトが元の名前を引き継ぐ。接合部はブーリアンで統合される
     ため、ダボのジオメトリは元のまま出力される。
     """
-    name = base.name
+    # ベース名は初回統合で "<パーツ名>_sculpt" に変わるため、関連オブジェクトは
+    # 名前ではなく識別子から引く(造形を足して再統合しても迷子にならない)。
+    name = base.get(PART_PROP)
+    if not name:
+        name = base.name
+        if name.endswith(SCULPT_SUFFIX):
+            name = name[:-len(SCULPT_SUFFIX)]
     joint = bpy.data.objects.get(name + JOINT_SUFFIX)
     source = bpy.data.objects.get(name + "_src")
 
@@ -745,13 +758,27 @@ def finalize_part(context, base, settings):
                         "(ダボ/ダボ穴が正しく再現されていない可能性)"
                         ).format(name, ratio)
 
-    base.name = name + "_sculpt"
+    if joint is None and settings.separate_joints and not warn:
+        warn = ("'{}' には接合部が検出されていません。ダボはリメッシュ精度の"
+                "ままです(変換時に全パーツを組み立て位置のまま選択して"
+                "いたか確認してください)").format(name)
+
+    # 再統合(造形を足してもう一度出力)に備え、前回この機能で作った出力を
+    # 置き換える。SculptBase 自身が付けた印を持つものだけを対象にする。
+    prev = bpy.data.objects.get(name)
+    if (prev is not None and prev is not base and prev is not out
+            and prev.get(FINAL_TAG) and prev.get(PART_PROP) == name):
+        _remove_object(prev)
+
+    if base.name != name + SCULPT_SUFFIX:
+        base.name = name + SCULPT_SUFFIX
     stash_source(context, base, SCULPT_COLLECTION)
     if joint is not None:
         stash_source(context, joint, SCULPT_COLLECTION)
     out.name = name
     out.data.name = name
     out[FINAL_TAG] = True
+    out[PART_PROP] = name
     if RESULT_TAG in out:
         del out[RESULT_TAG]
     return out, warn
@@ -806,9 +833,31 @@ def iter_convert(context, settings):
     重い処理の直前に ``(全体進捗 0..1, ラベル)`` を yield し、完了時に
     ``(results, n_protected)`` を return する。
     """
-    parts = [o for o in context.selected_objects if o.type == 'MESH']
+    selected = [o for o in context.selected_objects if o.type == 'MESH']
+    # 変換済み・接合部チャンク・出力済みを二重に変換すると名前が壊れる
+    # (実データで "Part_00_src_src_src" が発生した)ため除外する。
+    parts = [o for o in selected
+             if not (o.get(RESULT_TAG) or o.get(FINAL_TAG)
+                     or o.get(JOINT_TAG))]
+    skipped = len(selected) - len(parts)
     if not parts:
+        if skipped:
+            raise RuntimeError(
+                "選択中の {} 個はすべて変換済みです。造形を続けるなら"
+                "そのままスカルプトし、出力するなら「出力用に統合」を"
+                "使ってください。".format(skipped))
         raise RuntimeError("変換対象のメッシュを選択してください。")
+
+    warnings = []
+    if skipped:
+        warnings.append(
+            "変換済みの {} 個を除外しました(二重変換を防ぐため)".format(
+                skipped))
+    if settings.separate_joints and len(parts) < 2:
+        warnings.append(
+            "パーツが1個だけなので接合部を検出できません。ダボを厳密に"
+            "保持するには、噛み合う相手のパーツも一緒に選択してください")
+
     bvhs = {o: build_bvh(o) for o in parts}
     results = []
     total_protected = 0
@@ -827,8 +876,21 @@ def iter_convert(context, settings):
                 base = stop.value
         results.append(base)
         total_protected += base.get("sculptbase_protected_verts", 0)
+
+    # 接合部が1つも見つからないパーツは、ダボがリメッシュ精度どまりになる。
+    # 多くは「組み立て位置から動かした後に変換した」「一部しか選んでいない」
+    # のどちらかなので、その場で気づけるように知らせる。
+    if settings.separate_joints and len(parts) >= 2:
+        none_found = [o for o in results if not o.get(HAS_JOINT_PROP)]
+        if none_found:
+            warnings.append(
+                "{} 個のパーツで接合部が見つかりませんでした({} など)。"
+                "パーツを組み立て位置のまま、噛み合う相手ごと選択して"
+                "変換し直してください".format(
+                    len(none_found), none_found[0].name))
+
     _select_only(context, results)
-    return results, total_protected
+    return results, total_protected, warnings
 
 
 def convert_selection(context, settings):
