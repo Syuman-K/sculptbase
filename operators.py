@@ -66,7 +66,7 @@ class SculptBaseSettings(PropertyGroup):
                     "(スカルプト時に上げる)")
     joint_distance: FloatProperty(
         name="接合部判定距離",
-        default=0.001, min=0.0, soft_max=0.1, precision=4, unit='LENGTH',
+        default=1.0, min=0.0, soft_max=20.0, precision=3, unit='LENGTH',
         description="他パーツの表面からこの距離以内の頂点を接合部"
                     "(分割面・ダボ)としてマスク保護する")
     separate_joints: BoolProperty(
@@ -78,13 +78,13 @@ class SculptBaseSettings(PropertyGroup):
                     "ブーリアン統合される")
     joint_margin: FloatProperty(
         name="分離マージン",
-        default=0.003, min=0.0, soft_max=0.1, precision=4, unit='LENGTH',
+        default=3.0, min=0.0, soft_max=50.0, precision=3, unit='LENGTH',
         description="接合部を分離する際、判定距離にこの量を足した範囲まで"
                     "スカートとして含める。広いほどブーリアン統合が確実に"
                     "なるが、その分スカルプトできない領域が増える")
     joint_blend: FloatProperty(
         name="なじませ幅",
-        default=0.004, min=0.0, soft_max=0.1, precision=4, unit='LENGTH',
+        default=4.0, min=0.0, soft_max=50.0, precision=3, unit='LENGTH',
         description="出力時、接合部(完全にソースのまま)から造形面へ"
                     "切り替わる遷移帯の幅。ここを 0 にすると境目に段差が"
                     "出ることがある")

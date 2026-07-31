@@ -214,6 +214,69 @@ def test_finalize():
           "base+joint stashed".format(len(out.data.polygons)))
 
 
+def test_scale_sanity_warning():
+    """接合部判定距離がパーツ寸法に対して極端なら警告すること。
+
+    回帰: 既定値が 1単位=1m 前提(0.001)のまま、mm スケールのシーンで使うと
+    判定距離が実質ゼロになり、接合部が一切検出されないまま処理が通っていた。
+    """
+    print("== joint distance sanity vs part size ==")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    # 100 単位の大きなパーツ2個(mm 運用なら 100mm)
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16,
+                                         radius=50, location=(0, 0, 0))
+    a = bpy.context.active_object
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16,
+                                         radius=50, location=(100, 0, 0))
+    b = bpy.context.active_object
+
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.density_mode = 'MANUAL'
+    st.edge_length = 12.0
+    st.min_faces = 100
+    st.levels = 1
+    st.separate_joints = True
+    st.joint_margin = 3.0
+
+    a.select_set(True)
+    b.select_set(True)
+    bpy.context.view_layer.objects.active = a
+
+    st.joint_distance = 0.001          # 旧既定 = 100単位のパーツに対し極小
+    _r, _n, warnings = core.convert_selection(bpy.context, st)
+    if not any("小さすぎます" in w for w in warnings):
+        _fail("no warning for an implausibly small joint distance: {}".format(
+            warnings))
+    print("  0.001 (パーツ100) -> 小さすぎ警告あり")
+
+    # 大きすぎる側
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16,
+                                         radius=50, location=(0, 0, 0))
+    a = bpy.context.active_object
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16,
+                                         radius=50, location=(100, 0, 0))
+    b = bpy.context.active_object
+    a.select_set(True)
+    b.select_set(True)
+    bpy.context.view_layer.objects.active = a
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.density_mode = 'MANUAL'
+    st.edge_length = 12.0
+    st.min_faces = 100
+    st.levels = 1
+    st.separate_joints = True
+    st.joint_distance = 50.0           # パーツの半分
+    st.joint_margin = 3.0
+    _r, _n, warnings = core.convert_selection(bpy.context, st)
+    if not any("大きすぎます" in w for w in warnings):
+        _fail("no warning for an implausibly large joint distance: {}".format(
+            warnings))
+    print("  50 (パーツ100) -> 大きすぎ警告あり")
+
+
 def test_area_proportional_density():
     """ベース密度が面積比例になり、パーツ間で面あたり密度が揃うこと。
 
@@ -666,6 +729,8 @@ def main():
         test_double_convert_skipped()
         print()
         test_no_joint_warning()
+        print()
+        test_scale_sanity_warning()
         print()
         test_area_proportional_density()
         print()

@@ -920,6 +920,25 @@ def iter_convert(context, settings):
             "パーツが1個だけなので接合部を検出できません。ダボを厳密に"
             "保持するには、噛み合う相手のパーツも一緒に選択してください")
 
+    # 接合部判定距離がパーツの大きさに対して極端だと、接合部が全く取れない
+    # (小さすぎ)か、パーツの大半が接合部になる(大きすぎ)。単位設定に依存
+    # しない相対値で見張る。1単位=1mm 運用への移行時に効く。
+    ref = max((max(o.dimensions) for o in parts), default=0.0)
+    if settings.separate_joints and ref > 0.0:
+        rel = settings.joint_distance / ref
+        if rel < 0.0002:
+            warnings.append(
+                "接合部判定距離 {:.4g} はパーツの大きさ({:.4g})に対して"
+                "小さすぎます。接合部がまったく検出されない可能性が高いです"
+                "(パイプラインは 1単位=1mm 前提。1mm なら 1.0)".format(
+                    settings.joint_distance, ref))
+        elif rel > 0.2:
+            warnings.append(
+                "接合部判定距離 {:.4g} がパーツの大きさ({:.4g})に対して"
+                "大きすぎます。パーツの大半が接合部と判定され、造形できる"
+                "範囲がほとんど残りません".format(
+                    settings.joint_distance, ref))
+
     edge_length = compute_edge_length(settings, parts)
     print("[SculptBase] ベースのエッジ長: {:.5f}".format(edge_length))
     bvhs = {o: build_bvh(o) for o in parts}
