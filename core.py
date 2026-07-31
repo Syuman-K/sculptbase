@@ -54,6 +54,7 @@ FINAL_TAG = "sculptbase_final"
 # 関連オブジェクト(_joint / _src)を引くときは名前ではなくこれを使う。
 PART_PROP = "sculptbase_part"
 HAS_JOINT_PROP = "sculptbase_has_joint"
+NO_JOINT_REASON = "sculptbase_no_joint_reason"
 SCULPT_SUFFIX = "_sculpt"
 JOINT_GROUP = "SB_JointGuard"
 SOURCE_COLLECTION = "SB_Source"
@@ -428,22 +429,32 @@ def separate_joint(context, dense, other_bvhs, distance):
     """``dense`` の接合部(ダボ+スカート)と本体を分けたコピーを返す。
 
     他パーツ表面から ``distance`` 以内の頂点を含む面を接合部とみなす。
-    ``(body, joint)`` を返す。接合部が無い(または全面が接合部)場合は
-    ``(None, None)``。``dense`` 自体は変更しない。
+    ``(body, joint, reason)`` を返す。分離できなかった場合 body/joint は
+    ``None`` で、``reason`` に理由が入る:
+
+    * ``'none'``     — 近い頂点が無い(組み立て位置から外れている等)
+    * ``'all'``      — 全面が接合部(薄いパーツが他パーツに挟まれている等)
+
+    分離できた場合の ``reason`` は ``None``。``dense`` 自体は変更しない。
     """
     mesh = dense.data
     near = joint_vertex_indices(dense, other_bvhs, distance)
     if not near:
-        return None, None
+        return None, None, 'none'
     joint_faces = {p.index for p in mesh.polygons
                    if any(v in near for v in p.vertices)}
-    if not joint_faces or len(joint_faces) == len(mesh.polygons):
-        return None, None
+    if not joint_faces:
+        return None, None, 'none'
+    if len(joint_faces) == len(mesh.polygons):
+        # 全面が接合部だと「本体」が空になり分離が成立しない。判定距離が
+        # 大きすぎるか、パーツが小さすぎる。黙って通すとダボがリメッシュ
+        # 精度に落ちるので、呼び出し側で警告する。
+        return None, None, 'all'
     body = _faces_subset_object(context, dense, joint_faces, False,
                                 dense.name + "_bodytmp")
     joint = _faces_subset_object(context, dense, joint_faces, True,
                                  dense.name + "_jointtmp")
-    return body, joint
+    return body, joint, None
 
 
 # --------------------------------------------------------------------------- #
@@ -543,9 +554,10 @@ def _convert_part_stages(context, dense, settings, other_bvhs, edge_length):
     dense.name = name + "_src"
 
     body = joint = None
+    reason = None
     if getattr(settings, "separate_joints", True):
         yield 0.02, "接合部を分離"
-        body, joint = separate_joint(
+        body, joint, reason = separate_joint(
             context, dense, other_bvhs,
             settings.joint_distance + settings.joint_margin)
 
@@ -595,6 +607,7 @@ def _convert_part_stages(context, dense, settings, other_bvhs, edge_length):
     base[RESULT_TAG] = True
     base[PART_PROP] = name
     base[HAS_JOINT_PROP] = joint is not None
+    base[NO_JOINT_REASON] = reason or ""
     base["sculptbase_protected_verts"] = n_protected
     return base
 
@@ -855,11 +868,12 @@ def _select_only(context, objects):
         context.view_layer.objects.active = objects[0]
 
 
-def iter_finalize(context, settings):
+def iter_finalize(context, settings, should_cancel=None):
     """出力統合の段階実行ジェネレーター(進捗表示用)。
 
     各パーツの直前に ``(進捗 0..1, ラベル)`` を yield し、完了時に
-    ``(results, warnings)`` を return する。
+    ``(results, warnings)`` を return する。中断はパーツの切れ目でだけ
+    受け付けるので、半端な状態は残らない。
     """
     bases = [o for o in context.selected_objects if o.get(RESULT_TAG)]
     if not bases:
@@ -867,7 +881,11 @@ def iter_finalize(context, settings):
             "変換済みのベース(スカルプトベースに変換した結果)を選択してください。")
     results = []
     warnings = []
+    stopped_at = None
     for i, base in enumerate(bases):
+        if should_cancel is not None and should_cancel():
+            stopped_at = i
+            break
         yield i / len(bases), "統合 {} ({}/{})".format(
             base.name, i + 1, len(bases))
         out, warn = finalize_part(context, base, settings)
@@ -875,6 +893,11 @@ def iter_finalize(context, settings):
             results.append(out)
         if warn:
             warnings.append(warn)
+    if stopped_at is not None:
+        warnings.append(
+            "中断しました。{} / {} パーツまで統合済みです(残りのベースは"
+            "そのまま残っているので、選び直して続けられます)".format(
+                stopped_at, len(bases)))
     _select_only(context, results)
     return results, warnings
 
@@ -889,11 +912,14 @@ def finalize_selection(context, settings):
             return stop.value
 
 
-def iter_convert(context, settings):
+def iter_convert(context, settings, should_cancel=None):
     """変換の段階実行ジェネレーター(進捗表示用)。
 
     重い処理の直前に ``(全体進捗 0..1, ラベル)`` を yield し、完了時に
-    ``(results, n_protected)`` を return する。
+    ``(results, n_protected, warnings)`` を return する。
+
+    ``should_cancel`` は「中断すべきか」を返す呼び出し可能オブジェクト。
+    **パーツの切れ目でだけ**見るので、中断しても半端なパーツは残らない。
     """
     selected = [o for o in context.selected_objects if o.type == 'MESH']
     # 変換済み・接合部チャンク・出力済みを二重に変換すると名前が壊れる
@@ -939,13 +965,34 @@ def iter_convert(context, settings):
                 "範囲がほとんど残りません".format(
                     settings.joint_distance, ref))
 
+    # モディファイアは先に全パーツへ適用しておく。接合部分離は素のメッシュを
+    # 見るのに形状転写は評価後を見る、という食い違いを無くすため
+    # (EvenMesh と同じ「処理前に全適用」に揃える)。
+    baked = [o.name for o in parts if o.modifiers]
+    for i, obj in enumerate(parts):
+        if obj.modifiers:
+            yield i / (len(parts) * 8.0), "モディファイアを適用 ({}/{})".format(
+                i + 1, len(parts))
+            _bake_evaluated(context, obj)
+    if baked:
+        warnings.append(
+            "{} 個のモディファイアを適用しました({} など)。"
+            "ビューポート表示のレベルで焼き込まれます".format(
+                len(baked), baked[0]))
+
     edge_length = compute_edge_length(settings, parts)
     print("[SculptBase] ベースのエッジ長: {:.5f}".format(edge_length))
     bvhs = {o: build_bvh(o) for o in parts}
     results = []
     total_protected = 0
     n = len(parts)
+    stopped_at = None
     for i, dense in enumerate(parts):
+        # 中断はパーツの切れ目でだけ受け付ける。処理途中で放り出すと、
+        # ソース名だけ変わった半端なパーツや一時オブジェクトが残るため。
+        if should_cancel is not None and should_cancel():
+            stopped_at = i
+            break
         others = [bvh for o, bvh in bvhs.items()
                   if o is not dense and bvh is not None]
         gen = _convert_part_stages(context, dense, settings, others,
@@ -961,17 +1008,34 @@ def iter_convert(context, settings):
         results.append(base)
         total_protected += base.get("sculptbase_protected_verts", 0)
 
+    if stopped_at is not None:
+        warnings.append(
+            "中断しました。{} / {} パーツまで変換済みです(残りは未変換の"
+            "まま手つかずなので、選び直して続きを変換できます)".format(
+                stopped_at, n))
+
     # 接合部が1つも見つからないパーツは、ダボがリメッシュ精度どまりになる。
     # 多くは「組み立て位置から動かした後に変換した」「一部しか選んでいない」
     # のどちらかなので、その場で気づけるように知らせる。
     if settings.separate_joints and len(parts) >= 2:
-        none_found = [o for o in results if not o.get(HAS_JOINT_PROP)]
+        none_found = [o for o in results
+                      if not o.get(HAS_JOINT_PROP)
+                      and o.get(NO_JOINT_REASON) == 'none']
+        all_joint = [o for o in results
+                     if not o.get(HAS_JOINT_PROP)
+                     and o.get(NO_JOINT_REASON) == 'all']
         if none_found:
             warnings.append(
                 "{} 個のパーツで接合部が見つかりませんでした({} など)。"
                 "パーツを組み立て位置のまま、噛み合う相手ごと選択して"
                 "変換し直してください".format(
                     len(none_found), none_found[0].name))
+        if all_joint:
+            warnings.append(
+                "{} 個のパーツは全面が接合部と判定され、分離できませんでした"
+                "({} など)。ダボはリメッシュ精度どまりです。判定距離+分離"
+                "マージンがパーツの厚みに対して大きすぎないか確認してくだ"
+                "さい".format(len(all_joint), all_joint[0].name))
 
     _select_only(context, results)
     return results, total_protected, warnings

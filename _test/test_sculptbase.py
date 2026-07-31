@@ -277,6 +277,174 @@ def test_scale_sanity_warning():
     print("  50 (パーツ100) -> 大きすぎ警告あり")
 
 
+def test_modifiers_applied():
+    """モディファイアが処理前に適用され、接合部判定にも反映されること。
+
+    回帰: 接合部分離は素のメッシュ、形状転写は評価後、と食い違っていたため
+    モディファイア付きパーツの結果が予測できなかった。
+    """
+    print("== modifiers are applied before processing ==")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=8)
+    a = bpy.context.active_object
+    a.name = "shelled"
+    mod = a.modifiers.new("Shell", 'SOLIDIFY')
+    mod.thickness = 2.0
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=8,
+                                         location=(30, 0, 0))
+    b = bpy.context.active_object
+    b.name = "plain"
+
+    raw_polys = len(a.data.polygons)
+    bpy.context.view_layer.update()          # モディファイア追加を反映させる
+    dg = bpy.context.evaluated_depsgraph_get()
+    eval_mesh = a.evaluated_get(dg).to_mesh()
+    eval_polys = len(eval_mesh.polygons)
+    a.evaluated_get(dg).to_mesh_clear()
+    if eval_polys <= raw_polys:
+        _fail("test setup: solidify should add faces ({} -> {})".format(
+            raw_polys, eval_polys))
+
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.density_mode = 'MANUAL'
+    st.edge_length = 1.5
+    st.min_faces = 200
+    st.levels = 1
+    st.separate_joints = False
+    st.keep_source = True
+
+    a.select_set(True)
+    b.select_set(True)
+    bpy.context.view_layer.objects.active = a
+    _results, _n, warnings = core.convert_selection(bpy.context, st)
+
+    if not any("モディファイアを適用" in w for w in warnings):
+        _fail("no notice that modifiers were applied: {}".format(warnings))
+    src = bpy.data.objects.get("shelled_src")
+    if src is None:
+        _fail("source not stashed")
+    if src.modifiers:
+        _fail("source still carries modifiers")
+    # 退避されたソースが「適用後の形」になっていること。ここが素のままだと
+    # 接合部判定(素のメッシュ)と形状転写(評価後)が食い違う。
+    if len(src.data.polygons) != eval_polys:
+        _fail("source is not the evaluated mesh: {} faces (raw {} / "
+              "evaluated {})".format(len(src.data.polygons), raw_polys,
+                                     eval_polys))
+    print("  素 {} 面 -> 適用後 {} 面、退避ソースも {} 面で一致".format(
+        raw_polys, eval_polys, len(src.data.polygons)))
+
+
+def test_all_joint_warning():
+    """全面が接合部になったパーツを警告すること。"""
+    print("== part that is entirely joint is reported ==")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    # 大きな球2つに挟まれた小片 -> 全面が接合部になる
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=12, radius=20,
+                                         location=(0, 0, 0))
+    big_a = bpy.context.active_object
+    big_a.name = "big_a"
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=12, radius=20,
+                                         location=(44, 0, 0))
+    big_b = bpy.context.active_object
+    big_b.name = "big_b"
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8, radius=1.5,
+                                         location=(22, 0, 0))
+    thin = bpy.context.active_object
+    thin.name = "thin"
+
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.density_mode = 'MANUAL'
+    st.edge_length = 4.0
+    st.min_faces = 100
+    st.levels = 1
+    st.separate_joints = True
+    st.joint_distance = 1.0
+    st.joint_margin = 5.0        # 小片の直径より大きい -> 全面が接合部
+    st.keep_source = True
+
+    for o in (big_a, big_b, thin):
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = big_a
+    results, _n, warnings = core.convert_selection(bpy.context, st)
+
+    if not any("全面が接合部" in w for w in warnings):
+        _fail("no warning for an all-joint part: {}".format(warnings))
+    thin_base = next(o for o in results if o.get(core.PART_PROP) == "thin")
+    if thin_base.get(core.NO_JOINT_REASON) != 'all':
+        _fail("reason should be 'all', got {}".format(
+            thin_base.get(core.NO_JOINT_REASON)))
+    print("  警告あり / 理由コード = {}".format(
+        thin_base.get(core.NO_JOINT_REASON)))
+
+
+def test_graceful_cancel():
+    """中断はパーツの切れ目で効き、半端な状態を残さないこと。"""
+    print("== cancelling stops at a part boundary ==")
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    for i in range(3):
+        bpy.ops.mesh.primitive_uv_sphere_add(segments=16, ring_count=8,
+                                             radius=10,
+                                             location=(i * 40, 0, 0))
+        bpy.context.active_object.name = "p{}".format(i)
+    parts = [o for o in bpy.data.objects if o.type == 'MESH']
+    for o in parts:
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = parts[0]
+
+    st = bpy.context.scene.sculptbase
+    st.engine = 'QUADRIFLOW'
+    st.density_mode = 'MANUAL'
+    st.edge_length = 4.0
+    st.min_faces = 100
+    st.levels = 1
+    st.separate_joints = False
+    st.keep_source = True
+
+    state = {"cancel": False}
+    gen = core.iter_convert(bpy.context, st, lambda: state["cancel"])
+    # 最初のパーツが終わったところで中断を要求する
+    ticks = 0
+    while True:
+        try:
+            next(gen)
+            ticks += 1
+            if ticks > 4:
+                state["cancel"] = True
+        except StopIteration as stop:
+            results, _n, warnings = stop.value
+            break
+
+    if not any("中断しました" in w for w in warnings):
+        _fail("no cancellation notice: {}".format(warnings))
+    if not results:
+        _fail("cancel produced nothing; expected at least one finished part")
+    if len(results) >= 3:
+        _fail("cancel did not actually stop early ({} parts)".format(
+            len(results)))
+    # 完了したものは完全な形、未処理のものは手つかず
+    for base in results:
+        if not base.get(core.RESULT_TAG) or base.modifiers[0].type != 'MULTIRES':
+            _fail("finished part {} is incomplete".format(base.name))
+    done = {o.get(core.PART_PROP) for o in results}
+    for name in ("p0", "p1", "p2"):
+        if name in done:
+            continue
+        untouched = bpy.data.objects.get(name)
+        if untouched is None:
+            _fail("unprocessed part {} went missing".format(name))
+        if untouched.get(core.RESULT_TAG):
+            _fail("unprocessed part {} was half-converted".format(name))
+    leftovers = [o.name for o in bpy.data.objects
+                 if "tmp" in o.name or o.name.endswith("_bodytmp")]
+    if leftovers:
+        _fail("temporary objects left behind: {}".format(leftovers))
+    print("  {} / 3 パーツ完了、残りは手つかず、一時オブジェクト無し".format(
+        len(results)))
+
+
 def test_area_proportional_density():
     """ベース密度が面積比例になり、パーツ間で面あたり密度が揃うこと。
 
@@ -729,6 +897,12 @@ def main():
         test_double_convert_skipped()
         print()
         test_no_joint_warning()
+        print()
+        test_modifiers_applied()
+        print()
+        test_all_joint_warning()
+        print()
+        test_graceful_cancel()
         print()
         test_scale_sanity_warning()
         print()

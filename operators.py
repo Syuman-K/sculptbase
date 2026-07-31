@@ -115,13 +115,15 @@ class _ProgressModal:
     _gen = None
     _frac = 0.0
     _label = ""
+    _stopping = False
 
     def invoke(self, context, event):
         if context.window is None:
             return self.execute(context)
         st = context.scene.sculptbase
+        self._stopping = False
         try:
-            self._gen = self._iter(context, st)
+            self._gen = self._iter(context, st, self._should_cancel)
         except RuntimeError as exc:
             self.report({'WARNING'}, str(exc))
             return {'CANCELLED'}
@@ -132,24 +134,32 @@ class _ProgressModal:
         self._set_status(context)
         return {'RUNNING_MODAL'}
 
+    def _should_cancel(self):
+        return self._stopping
+
     def _set_status(self, context):
         filled = int(round(20 * self._frac))
         bar = "█" * filled + "░" * (20 - filled)
+        tail = ("中断待ち — 現在のパーツを終えたら止まります"
+                if self._stopping else "Esc で中止")
         try:
             context.workspace.status_text_set(
-                "{}: [{}] {}%  {}  —  Esc で中止".format(
+                "{}: [{}] {}%  {}  —  {}".format(
                     self.bl_label, bar, int(round(100 * self._frac)),
-                    self._label))
+                    self._label, tail))
         except Exception:
             pass
 
     def modal(self, context, event):
-        if event.type == 'ESC':
-            self._cleanup(context)
-            self.report({'WARNING'},
-                        "SculptBase: 中止しました({}% 時点)".format(
-                            int(round(100 * self._frac))))
-            return {'CANCELLED'}
+        if event.type == 'ESC' and not self._stopping:
+            # ここで即座に打ち切ると、ソース名だけ変わった半端なパーツや
+            # 一時オブジェクトが残る。現在のパーツを最後まで処理させてから
+            # 止めることで、常に「N個完了・残りは手つかず」の状態にする。
+            self._stopping = True
+            self._set_status(context)
+            self.report({'INFO'},
+                        "SculptBase: 現在のパーツを終えたら中断します")
+            return {'RUNNING_MODAL'}
         if event.type != 'TIMER':
             return {'RUNNING_MODAL'}
         try:
@@ -193,8 +203,8 @@ class SCULPTBASE_OT_convert(_ProgressModal, Operator):
     def poll(cls, context):
         return any(o.type == 'MESH' for o in context.selected_objects)
 
-    def _iter(self, context, settings):
-        return core.iter_convert(context, settings)
+    def _iter(self, context, settings, should_cancel=None):
+        return core.iter_convert(context, settings, should_cancel)
 
     def _report_done(self, value):
         results, n_protected, warnings = value
@@ -260,8 +270,8 @@ class SCULPTBASE_OT_finalize(_ProgressModal, Operator):
     def poll(cls, context):
         return any(o.get(core.RESULT_TAG) for o in context.selected_objects)
 
-    def _iter(self, context, settings):
-        return core.iter_finalize(context, settings)
+    def _iter(self, context, settings, should_cancel=None):
+        return core.iter_finalize(context, settings, should_cancel)
 
     def _report_done(self, value):
         results, warnings = value
